@@ -81,6 +81,42 @@ class DataCompressor:
             'mission_complete': status['mission_complete']
         }
 
+    @staticmethod
+    def compress_lidar_keyframe(lidar_data: dict) -> Dict[str, Any]:
+        """Compress a 54×42 LiDAR depth grid keyframe (~1-5 KB compressed).
+
+        Encodes ranges as uint16 millimetres (0-9000mm) for compact transmission.
+        """
+        ranges = lidar_data.get("ranges", [])
+        # Quantise to millimetres as uint16
+        mm_ranges = [min(65535, int(r * 1000)) for r in ranges]
+        return {
+            'r': mm_ranges,
+            'sa': round(lidar_data.get("start_angle", 0.0), 4),
+            'as': round(lidar_data.get("angle_step", 0.0), 5),
+            'n': lidar_data.get("num_rays", len(ranges)),
+        }
+
+    @staticmethod
+    def compress_pose(position, orientation: float) -> Dict[str, Any]:
+        """Compress drone pose for transmission (~50-80 bytes)."""
+        return {
+            'x': round(float(position[0]), 2),
+            'y': round(float(position[1]), 2),
+            'z': round(float(position[2]), 2) if len(position) > 2 else 0.0,
+            'th': round(float(orientation), 3),
+        }
+
+    @staticmethod
+    def compress_object_detection(detection) -> Dict[str, Any]:
+        """Compress an object detection for transmission (~100-500 bytes)."""
+        return {
+            'type': detection.object_type.value if hasattr(detection.object_type, 'value') else str(detection.object_type),
+            'conf': round(detection.confidence, 2),
+            'pos': [round(detection.position[0], 1), round(detection.position[1], 1)],
+            'time': int(detection.timestamp),
+        }
+
 class MessageFormatter:
     """
     Formats messages for different communication protocols.
@@ -127,75 +163,108 @@ class MessageFormatter:
 class CommProtocol:
     """
     Communication protocol handler.
-    Simulates different communication methods (WiFi, cellular, satellite).
+    Simulates different communication methods (WiFi, XBee 900 MHz, cellular, satellite).
+    Default is xbee_900mhz to match real drone hardware.
     """
-    
-    def __init__(self, protocol_type: str = "wifi"):
+
+    # Maximum XBee fragment payload size (bytes)
+    MAX_FRAGMENT_SIZE = 200
+
+    def __init__(self, protocol_type: str = "xbee_900mhz"):
         """Initialize communication protocol."""
         self.protocol_type = protocol_type
         self.bandwidth_limit = self._get_bandwidth_limit()
         self.latency = self._get_latency()
         self.reliability = self._get_reliability()
-        
+        self.max_fragment_size = self.MAX_FRAGMENT_SIZE
+
+        # Bandwidth tracking (rolling window)
+        self._bandwidth_window_start = time.time()
+        self._bandwidth_bytes_this_window = 0
+        self._bandwidth_window_secs = 1.0  # 1-second window
+
         # Transmission statistics
         self.bytes_sent = 0
         self.messages_sent = 0
         self.failed_transmissions = 0
-        
+
     def _get_bandwidth_limit(self) -> int:
-        """Get bandwidth limit based on protocol type."""
+        """Get bandwidth limit based on protocol type (bytes/s)."""
         limits = {
-            "wifi": 1000000,      # 1 MB/s
-            "cellular": 100000,   # 100 KB/s
-            "satellite": 10000,   # 10 KB/s
-            "lora": 1000          # 1 KB/s
+            "xbee_900mhz": 12500,  # 100 kbps = 12.5 KB/s
+            "wifi": 1000000,       # 1 MB/s
+            "cellular": 100000,    # 100 KB/s
+            "satellite": 10000,    # 10 KB/s
+            "lora": 1000           # 1 KB/s
         }
-        return limits.get(self.protocol_type, 10000)
-    
+        return limits.get(self.protocol_type, 12500)
+
     def _get_latency(self) -> float:
-        """Get typical latency for protocol."""
+        """Get typical latency for protocol (seconds)."""
         latencies = {
-            "wifi": 0.01,       # 10ms
-            "cellular": 0.1,    # 100ms
-            "satellite": 0.6,   # 600ms
-            "lora": 1.0         # 1000ms
+            "xbee_900mhz": 0.05,  # 50ms average (20-80ms per hop)
+            "wifi": 0.01,          # 10ms
+            "cellular": 0.1,       # 100ms
+            "satellite": 0.6,      # 600ms
+            "lora": 1.0            # 1000ms
         }
-        return latencies.get(self.protocol_type, 1.0)
-    
+        return latencies.get(self.protocol_type, 0.05)
+
     def _get_reliability(self) -> float:
         """Get reliability (success rate) for protocol."""
         reliabilities = {
+            "xbee_900mhz": 0.92,  # 8% base packet loss
             "wifi": 0.98,
             "cellular": 0.95,
             "satellite": 0.90,
             "lora": 0.85
         }
-        return reliabilities.get(self.protocol_type, 0.85)
-    
+        return reliabilities.get(self.protocol_type, 0.92)
+
     def can_send(self, message_size: int) -> bool:
         """Check if message can be sent given bandwidth constraints."""
-        return message_size <= self.bandwidth_limit
-    
+        # Check rolling bandwidth budget
+        now = time.time()
+        if now - self._bandwidth_window_start >= self._bandwidth_window_secs:
+            self._bandwidth_window_start = now
+            self._bandwidth_bytes_this_window = 0
+        remaining = self.bandwidth_limit - self._bandwidth_bytes_this_window
+        return message_size <= remaining
+
+    def fragment_message(self, payload_bytes: bytes) -> list:
+        """Split large payloads into ≤200-byte fragments.
+
+        Returns list of bytes fragments. Each fragment is at most
+        max_fragment_size bytes.
+        """
+        if len(payload_bytes) <= self.max_fragment_size:
+            return [payload_bytes]
+        fragments = []
+        for offset in range(0, len(payload_bytes), self.max_fragment_size):
+            fragments.append(payload_bytes[offset:offset + self.max_fragment_size])
+        return fragments
+
     def simulate_transmission(self, message: Message) -> bool:
         """Simulate message transmission with protocol characteristics."""
         import random
-        
+
         # Simulate transmission delay
         time.sleep(self.latency * 0.001)  # Convert to actual delay for simulation
-        
+
         # Simulate transmission success/failure
         success = random.random() < self.reliability
-        
+
         if success:
             self.messages_sent += 1
             # Estimate message size (rough approximation)
             message_size = len(json.dumps(asdict(message), default=str))
             self.bytes_sent += message_size
+            self._bandwidth_bytes_this_window += message_size
         else:
             self.failed_transmissions += 1
-        
+
         return success
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """Get transmission statistics."""
         return {
@@ -203,6 +272,7 @@ class CommProtocol:
             'bytes_sent': self.bytes_sent,
             'messages_sent': self.messages_sent,
             'failed_transmissions': self.failed_transmissions,
+            'bandwidth_limit_bps': self.bandwidth_limit,
             'success_rate': self.messages_sent / (self.messages_sent + self.failed_transmissions) if (self.messages_sent + self.failed_transmissions) > 0 else 0
         }
 
@@ -212,29 +282,31 @@ class CommSystem:
     Handles message queuing, prioritization, compression, and transmission.
     """
     
-    def __init__(self, protocol_type: str = "wifi"):
-        """Initialize communication system."""
+    def __init__(self, protocol_type: str = "xbee_900mhz"):
+        """Initialize communication system (default: XBee 900 MHz mesh radio)."""
         self.protocol = CommProtocol(protocol_type)
         self.compressor = DataCompressor()
         self.formatter = MessageFormatter()
-        
+
         # Message queuing
         self.message_queue = PriorityQueue()
         self.pending_messages = {}
-        # NEW: Recent successfully sent message summaries for GUI display
+        # Store-and-forward buffer for messages that can't be delivered
+        self.store_buffer = []
+        # Recent successfully sent message summaries for GUI display
         self._sent_log = []  # list[str]
-        # NEW: Track which detection object types we've already displayed (GUI dedupe)
+        # Track which detection object types we've already displayed (GUI dedupe)
         self._seen_detection_types = set()
-        
+
         # System state
         self.is_active = True
         self.transmission_thread = None
         self.callbacks = {}  # Message type -> callback function
-        
-        # Transmission control
-        self.transmission_interval = 1.0  # seconds
-        self.batch_size = 5  # messages per batch
-        
+
+        # Transmission control — adjusted for XBee timing
+        self.transmission_interval = 0.5 if protocol_type == "xbee_900mhz" else 1.0
+        self.batch_size = 3 if protocol_type == "xbee_900mhz" else 5
+
         # Start transmission thread
         self._start_transmission_thread()
     

@@ -18,23 +18,31 @@ class DroneManager:
     Manages multiple drones with mesh networking and coordinated search.
     """
     
-    # Drone colors for visualization (RGB tuples)
+    # Drone colors for visualization (RGB tuples) — supports up to 12 drones
     COLORS = [
         (255, 80, 80),    # Red - Drone 0
         (80, 80, 255),    # Blue - Drone 1
         (80, 255, 80),    # Green - Drone 2
         (255, 200, 80),   # Orange - Drone 3
+        (200, 80, 255),   # Purple - Drone 4
+        (80, 220, 220),   # Cyan - Drone 5
+        (255, 130, 180),  # Pink - Drone 6
+        (180, 180, 80),   # Olive - Drone 7
+        (255, 160, 80),   # Tangerine - Drone 8
+        (80, 180, 130),   # Teal - Drone 9
+        (200, 120, 80),   # Brown - Drone 10
+        (160, 80, 160),   # Plum - Drone 11
     ]
     
     def __init__(self, count: int = 1, comm_range: float = 10.0):
         """
         Initialize drone manager.
-        
+
         Args:
-            count: Number of drones (1-4)
+            count: Number of drones (1-12)
             comm_range: Communication range in meters
         """
-        self.count = max(1, min(4, count))
+        self.count = max(1, min(12, count))
         self.comm_range = comm_range
         
         # Per-drone instances
@@ -418,7 +426,7 @@ class DroneManager:
             count: New drone count (1-4)
             entry_point: Entry point for drones
         """
-        self.count = max(1, min(4, count))
+        self.count = max(1, min(12, count))
         self.initialize(entry_point)
     
     def reset(self, entry_point: Tuple[float, float] = (25.0, -3.0)):

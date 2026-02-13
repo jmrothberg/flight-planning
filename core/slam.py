@@ -57,31 +57,44 @@ class GridMap:
         y = (grid_y + 0.5) * self.resolution
         return x, y
     
-    def update_with_lidar(self, robot_pos: Tuple[float, float], 
-                         robot_theta: float, 
-                         lidar_ranges: List[float],
-                         max_range: float = 25.0):
-        """Update map using LIDAR scan data."""
+    def update_with_lidar(self, robot_pos: Tuple[float, float],
+                         robot_theta: float,
+                         lidar_ranges,
+                         max_range: float = 9.0):
+        """Update map using LIDAR scan data.
+
+        Accepts either:
+          - dict with keys 'ranges', 'start_angle', 'angle_step' (new STM format)
+          - plain list of floats (legacy 360° format, for backward compat)
+        """
         robot_grid_x, robot_grid_y = self.world_to_grid(robot_pos[0], robot_pos[1])
-        
-        num_rays = len(lidar_ranges)
-        angle_step = 2 * math.pi / num_rays
-        
-        for i, range_reading in enumerate(lidar_ranges):
+
+        # Unpack new dict format or fall back to legacy list
+        if isinstance(lidar_ranges, dict):
+            ranges = lidar_ranges["ranges"]
+            start_angle = lidar_ranges["start_angle"]
+            angle_step = lidar_ranges["angle_step"]
+        else:
+            ranges = lidar_ranges
+            num_rays = len(ranges)
+            start_angle = robot_theta
+            angle_step = 2 * math.pi / num_rays if num_rays > 0 else 0
+
+        for i, range_reading in enumerate(ranges):
             if range_reading >= max_range:
                 continue  # Ignore max range readings
-                
+
             # Calculate ray angle
-            ray_angle = robot_theta + (i * angle_step)
-            
+            ray_angle = start_angle + (i * angle_step)
+
             # Calculate end point of ray in world
             end_x = robot_pos[0] + range_reading * math.cos(ray_angle)
             end_y = robot_pos[1] + range_reading * math.sin(ray_angle)
             end_grid_x, end_grid_y = self.world_to_grid(end_x, end_y)
-            
+
             # Trace ray using Bresenham's algorithm
             cells = self._bresenham_line(robot_grid_x, robot_grid_y, end_grid_x, end_grid_y)
-            
+
             # Mark cells along ray as free (except the last one)
             for j, (cell_x, cell_y) in enumerate(cells[:-1]):
                 if 0 <= cell_x < self.grid_width and 0 <= cell_y < self.grid_height:
@@ -89,7 +102,7 @@ class GridMap:
                     current_val = int(self.grid[cell_y, cell_x])
                     self.grid[cell_y, cell_x] = max(0, current_val - 5)
                     self.explored_cells.add((cell_x, cell_y))
-            
+
             # Mark end cell as occupied (obstacle)
             if 0 <= end_grid_x < self.grid_width and 0 <= end_grid_y < self.grid_height:
                 current_val = int(self.grid[end_grid_y, end_grid_x])
@@ -194,16 +207,19 @@ class ParticleFilter:
             # Normalize angle
             particle.theta = self._normalize_angle(particle.theta)
     
-    def update(self, lidar_ranges: List[float], grid_map: GridMap):
-        """Update particle weights based on sensor observations."""
+    def update(self, lidar_ranges, grid_map: GridMap):
+        """Update particle weights based on sensor observations.
+
+        Accepts dict (new STM format) or plain list (legacy).
+        """
         if not self.initialized:
             return
-        
+
         for particle in self.particles:
             # Calculate likelihood of observation given particle pose
             likelihood = self._calculate_likelihood(particle, lidar_ranges, grid_map)
             particle.weight *= likelihood
-        
+
         # Normalize weights
         total_weight = sum(p.weight for p in self.particles)
         if total_weight > 1e-10:  # Avoid division by zero
@@ -213,7 +229,7 @@ class ParticleFilter:
             # Reset weights if all are zero/very small
             for particle in self.particles:
                 particle.weight = 1.0 / self.num_particles
-        
+
         # Resample if effective particle count is low
         if self._effective_particle_count() < self.num_particles / 2:
             self._resample()
@@ -237,23 +253,39 @@ class ParticleFilter:
         
         return (x, y, theta)
     
-    def _calculate_likelihood(self, particle: Particle, lidar_ranges: List[float], 
+    def _calculate_likelihood(self, particle: Particle, lidar_ranges,
                             grid_map: GridMap) -> float:
-        """Calculate observation likelihood for a particle."""
+        """Calculate observation likelihood for a particle.
+
+        Accepts dict (new STM format) or plain list (legacy).
+        """
         likelihood = 1.0
-        
-        num_rays = len(lidar_ranges)
-        angle_step = 2 * math.pi / num_rays
-        
-        # Sample every 10th ray for efficiency
-        for i in range(0, num_rays, 10):
-            expected_range = self._expected_range(particle, i * angle_step, grid_map)
-            observed_range = lidar_ranges[i]
-            
+
+        # Unpack new dict format or fall back to legacy list
+        if isinstance(lidar_ranges, dict):
+            ranges = lidar_ranges["ranges"]
+            start_angle = lidar_ranges["start_angle"]
+            angle_step = lidar_ranges["angle_step"]
+        else:
+            ranges = lidar_ranges
+            num_rays = len(ranges)
+            start_angle = particle.theta
+            angle_step = 2 * math.pi / num_rays if num_rays > 0 else 0
+
+        num_rays = len(ranges)
+        # With only 54 rays, sample every 6th for efficiency (~9 samples)
+        step = max(1, num_rays // 9)
+        for i in range(0, num_rays, step):
+            ray_angle = start_angle + i * angle_step
+            # _expected_range expects angle relative to particle theta
+            rel_angle = ray_angle - particle.theta
+            expected_range = self._expected_range(particle, rel_angle, grid_map)
+            observed_range = ranges[i]
+
             # Gaussian likelihood model
             diff = abs(expected_range - observed_range)
             likelihood *= math.exp(-diff * diff / (2 * 0.5 * 0.5))
-        
+
         return likelihood
     
     def _expected_range(self, particle: Particle, ray_angle: float, 
@@ -358,7 +390,7 @@ class SLAMSystem:
         # Plan initial exploration (defer until we have environment reference)
         self.exploration_points = []
     
-    def update(self, current_pos: Tuple[float, float], lidar_ranges: List[float], 
+    def update(self, current_pos: Tuple[float, float], lidar_ranges,
               current_theta: Optional[float] = None):
         """Update SLAM system with new sensor data."""
         if not self.initialized:

@@ -25,9 +25,10 @@ class Environment:
         self.obstacles = []  # List of circular obstacles [(x,y,radius)]
         self.objects_of_interest = []  # People, important items [(x,y,type,confidence)]
         
-        # Sensor parameters
-        self.lidar_range = 25.0  # meters  # increased to detect openings further away
-        self.lidar_resolution = 360  # number of rays
+        # Sensor parameters — STM 54×42 LiDAR (71° diagonal FoV, 9m range)
+        self.lidar_range = 9.0  # meters (STM 54×42 max range)
+        self.lidar_resolution = 54  # horizontal rays (one per column of 54×42 grid)
+        self.lidar_hfov = math.radians(59.0)  # horizontal FoV derived from 71° diagonal, 54:42 aspect
         self.camera_fov = 60.0  # degrees
         self.camera_range = 8.0  # meters
         
@@ -295,20 +296,35 @@ class Environment:
             (42, 42, 1.2)    # Top-right
         ]
     
-    def get_lidar_scan(self, position: np.ndarray, orientation: float) -> List[float]:
+    def get_lidar_scan(self, position: np.ndarray, orientation: float) -> dict:
         """
-        Simulate LIDAR scan from given position and orientation.
-        Returns list of distances for each ray.
+        Simulate STM 54×42 LiDAR scan from given position and orientation.
+
+        Returns dict with:
+            ranges: list of 54 distances (one per horizontal column)
+            start_angle: absolute angle of first ray
+            angle_step: angular spacing between consecutive rays
+            hfov: total horizontal field of view in radians
+            num_rays: number of rays (54)
         """
+        num_rays = self.lidar_resolution  # 54
+        hfov = self.lidar_hfov  # ~59°
+        angle_step = hfov / max(1, num_rays - 1)
+        start_angle = orientation - hfov / 2.0
+
         distances = []
-        angle_step = 2 * math.pi / self.lidar_resolution
-        
-        for i in range(self.lidar_resolution):
-            ray_angle = orientation + (i * angle_step)
+        for i in range(num_rays):
+            ray_angle = start_angle + i * angle_step
             distance = self._cast_ray(position[:2], ray_angle)
             distances.append(min(distance, self.lidar_range))
-        
-        return distances
+
+        return {
+            "ranges": distances,
+            "start_angle": start_angle,
+            "angle_step": angle_step,
+            "hfov": hfov,
+            "num_rays": num_rays,
+        }
     
     def get_camera_view(self, position: np.ndarray, orientation: float) -> Dict:
         """

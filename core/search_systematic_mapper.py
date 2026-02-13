@@ -223,22 +223,34 @@ class SystematicMapper:
         # Fallback: move forward
         return (px + 2 * math.cos(orientation), py + 2 * math.sin(orientation))
 
-    def _update_map(self, px: float, py: float, lidar: List[float], ori: float):
-        """Update grid map from LIDAR scan."""
+    def _update_map(self, px: float, py: float, lidar, ori: float):
+        """Update grid map from LIDAR scan.
+
+        Accepts dict (new STM 54×42 format) or plain list (legacy 360°).
+        """
         if not lidar:
             return
-        
-        n = len(lidar)
-        angle_step = 2 * math.pi / n
-        
-        for i in range(n):
-            dist = lidar[i]
+
+        # Unpack new dict format or fall back to legacy list
+        if isinstance(lidar, dict):
+            ranges = lidar["ranges"]
+            start_angle = lidar["start_angle"]
+            angle_step = lidar["angle_step"]
+            max_range = 9.0
+        else:
+            ranges = lidar
+            n = len(ranges)
+            start_angle = ori
+            angle_step = 2 * math.pi / n if n > 0 else 0
+            max_range = 12.0
+
+        for i, dist in enumerate(ranges):
             if not math.isfinite(dist) or dist <= 0:
                 continue
-            
-            angle = ori + i * angle_step
-            dist = min(dist, 12.0)
-            
+
+            angle = start_angle + i * angle_step
+            dist = min(dist, max_range)
+
             # Mark cells along ray as FREE
             ray_steps = int(dist / (self.grid_size / 2))
             for s in range(ray_steps):
@@ -246,12 +258,12 @@ class SystematicMapper:
                 rx = px + r * math.cos(angle)
                 ry = py + r * math.sin(angle)
                 cell = self._to_grid(rx, ry)
-                
+
                 if cell not in self.wall_cells and cell[1] >= 0:
                     self.free_cells.add(cell)
-            
+
             # Mark endpoint as WALL
-            if dist < 11.0:
+            if dist < max_range - 1.0:
                 wx = px + dist * math.cos(angle)
                 wy = py + dist * math.sin(angle)
                 wall_cell = self._to_grid(wx, wy)

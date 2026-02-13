@@ -33,7 +33,7 @@ Controls:
 - R: Reset simulation
 - N: New object placement (same building)
 - B: New building layout (5 realistic connected room configurations)
-- D: Cycle drone count (1-4) for multi-drone mode
+- D: Cycle drone count (1-12) for multi-drone mode
 - +/=: Increase communication range
 - -: Decrease communication range
 - P: Save screenshot
@@ -134,8 +134,16 @@ class DroneSimulation:
         # NEW: hide SLAM occupancy map by default to remove gray/black spray
         self._show_map = False
         
+        # Periodic rotation for limited-FoV LiDAR (STM 54×42, 59° HFoV)
+        # Drone rotates in-place periodically to build 360° awareness
+        self._rotation_scan_interval = 5.0   # seconds between rotation scans
+        self._last_rotation_scan = 0.0       # timestamp of last rotation scan
+        self._rotation_scan_active = False   # currently performing rotation scan
+        self._rotation_scan_target = 0.0     # target orientation for scan
+        self._rotation_scan_steps = 0        # number of rotation steps remaining
+
         # MULTI-DRONE SUPPORT
-        self.drone_count = 1  # Number of drones (1-4)
+        self.drone_count = 1  # Number of drones (1-12)
         self.comm_range = 10.0  # Communication range in meters
         self.drone_manager: Optional[DroneManager] = None  # Created when drone_count > 1
         self.multi_drone_mode = False  # Flag for multi-drone operation
@@ -358,10 +366,10 @@ class DroneSimulation:
                     except Exception as e:
                         print(f"Failed to save screenshot: {e}")
                 elif event.key == pygame.K_d:
-                    # Cycle drone count (1 -> 2 -> 3 -> 4 -> 1)
+                    # Cycle drone count (1 -> 2 -> ... -> 12 -> 1)
                     # DON'T reset - just add/remove drones while preserving current state
                     old_count = self.drone_count
-                    self.drone_count = (self.drone_count % 4) + 1
+                    self.drone_count = (self.drone_count % 12) + 1
                     print(f"Drone count: {old_count} -> {self.drone_count}")
                     self._setup_multi_drone(preserve_drone_0=True)
                 elif event.key in [pygame.K_PLUS, pygame.K_EQUALS]:
@@ -425,8 +433,23 @@ class DroneSimulation:
         if self.lidar_data:
             self.minimap.add_lidar_scan(self.drone.position[:2], self.lidar_data, self.drone.orientation)
         
-        # No need for exploration planning with wall following algorithm
-        
+        # Periodic rotation scan for limited-FoV LiDAR (59° HFoV)
+        # Every few seconds when inside building, rotate in-place to accumulate
+        # a 360° picture from multiple 59° sweeps.
+        if self._inside_building:
+            simulated_now = (time.time() - self._start_time) * SIM_SPEED if self._start_time else 0
+            if simulated_now - self._last_rotation_scan >= self._rotation_scan_interval:
+                self._last_rotation_scan = simulated_now
+                # Do a quick rotation: take scans at multiple orientations
+                base_ori = self.drone.orientation
+                hfov = self.environment.lidar_hfov  # ~59°
+                num_extra_scans = max(1, int(2 * math.pi / hfov) - 1)  # ~5 extra scans
+                for scan_i in range(1, num_extra_scans + 1):
+                    scan_angle = base_ori + scan_i * hfov
+                    extra_scan = self.environment.get_lidar_scan(self.drone.position, scan_angle)
+                    self.slam.update(self.drone.position[:2], extra_scan)
+                    self.minimap.add_lidar_scan(self.drone.position[:2], extra_scan, scan_angle)
+
         # Process vision data
         detected_objects = self.vision.process_frame(camera_image)
         
@@ -1124,14 +1147,32 @@ class DroneSimulation:
             # Main search phase - drone is inside building
             # Get LIDAR data for this drone
             lidar_data = self.environment.get_lidar_scan(drone.position, drone.orientation)
-            
+
             # Update SLAM with sensor data (for pathfinding)
             self.slam.update(drone.position[:2], lidar_data)
-            
+
             # Update minimap with LIDAR data (for visualization)
             if lidar_data:
                 self.minimap.add_lidar_scan(drone.position[:2], lidar_data, drone.orientation)
-            
+
+            # Periodic rotation scan for limited-FoV LiDAR (59° HFoV)
+            start_time_i = self.drone_manager.mission_start_times[i]
+            if start_time_i:
+                sim_now = (time.time() - start_time_i) * SIM_SPEED
+                if not hasattr(self, '_multi_last_rotation'):
+                    self._multi_last_rotation = {}
+                last_rot = self._multi_last_rotation.get(i, 0.0)
+                if sim_now - last_rot >= self._rotation_scan_interval:
+                    self._multi_last_rotation[i] = sim_now
+                    base_ori = drone.orientation
+                    hfov = self.environment.lidar_hfov
+                    num_extra = max(1, int(2 * math.pi / hfov) - 1)
+                    for si in range(1, num_extra + 1):
+                        scan_angle = base_ori + si * hfov
+                        extra = self.environment.get_lidar_scan(drone.position, scan_angle)
+                        self.slam.update(drone.position[:2], extra)
+                        self.minimap.add_lidar_scan(drone.position[:2], extra, scan_angle)
+
             # Update search algorithm with global knowledge (gossip already synced in Phase 1-2)
             self.drone_manager.update_search_from_gossip(i)
             
@@ -1179,15 +1220,22 @@ class DroneSimulation:
                 # Fallback: if no target, explore in a new direction
                 if target is None:
                     # No unsearched cells - try moving toward unexplored areas
-                    # Find direction with most open space (LIDAR is a LIST, not dict)
-                    if lidar_data and len(lidar_data) > 0:
+                    # Find direction with most open space in LiDAR data
+                    if lidar_data:
+                        if isinstance(lidar_data, dict):
+                            ranges = lidar_data["ranges"]
+                            _start_angle = lidar_data["start_angle"]
+                            _angle_step = lidar_data["angle_step"]
+                        else:
+                            ranges = lidar_data
+                            _start_angle = drone.orientation
+                            _angle_step = 2 * math.pi / len(ranges) if len(ranges) > 0 else 0
                         best_angle = drone.orientation
                         best_dist = 0
-                        angle_step = 2 * math.pi / len(lidar_data)
-                        for idx, dist in enumerate(lidar_data):
+                        for idx, dist in enumerate(ranges):
                             if dist > best_dist:
                                 best_dist = dist
-                                best_angle = drone.orientation + idx * angle_step
+                                best_angle = _start_angle + idx * _angle_step
                         # Move toward most open direction - WITH WALL CHECK
                         step = min(best_dist * 0.5, 2.0)
                         test_pos = (

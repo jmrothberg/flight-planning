@@ -88,35 +88,44 @@ class MinimapSystem:
         world_y = self.min_y + grid_y * self.resolution
         return (world_x, world_y)
     
-    def add_lidar_scan(self, drone_pos: Tuple[float, float], lidar_distances: List[float], drone_orientation: float = 0.0):
+    def add_lidar_scan(self, drone_pos: Tuple[float, float], lidar_distances, drone_orientation: float = 0.0):
         """
         Process LIDAR scan to discover walls and open areas.
-        
+
         Args:
             drone_pos: Current drone position (x, y)
-            lidar_distances: List of distances for each LIDAR ray
+            lidar_distances: dict (new STM format) or list (legacy)
             drone_orientation: Drone's current orientation in radians
         """
         drone_x, drone_y = drone_pos
-        
+
         # Mark drone's current cell as explored
         drone_grid = self.world_to_grid(drone_pos)
         self.explored_cells.add(drone_grid)
-        
-        # Calculate LIDAR parameters (should match environment.py)
-        lidar_resolution = len(lidar_distances)
-        angle_step = 2 * math.pi / lidar_resolution if lidar_resolution > 0 else 0
-        
+
+        # Unpack new dict format or fall back to legacy list
+        if isinstance(lidar_distances, dict):
+            ranges = lidar_distances["ranges"]
+            start_angle = lidar_distances["start_angle"]
+            angle_step = lidar_distances["angle_step"]
+            max_range = 9.0
+        else:
+            ranges = lidar_distances
+            lidar_resolution = len(ranges)
+            start_angle = drone_orientation
+            angle_step = 2 * math.pi / lidar_resolution if lidar_resolution > 0 else 0
+            max_range = 15.0
+
         # Process each LIDAR hit
-        for i, distance in enumerate(lidar_distances):
-            if distance > 0 and distance < 15.0:  # Valid hit within reasonable range
+        for i, distance in enumerate(ranges):
+            if distance > 0 and distance < max_range:  # Valid hit within range
                 # Calculate ray angle
-                ray_angle = drone_orientation + (i * angle_step)
-                
+                ray_angle = start_angle + (i * angle_step)
+
                 # Calculate hit position
                 hit_x = drone_x + distance * math.cos(ray_angle)
                 hit_y = drone_y + distance * math.sin(ray_angle)
-                
+
                 # This represents a wall/obstacle
                 wall_feature = DiscoveredFeature(
                     feature_type=FeatureType.WALL,
@@ -125,9 +134,9 @@ class MinimapSystem:
                     timestamp=np.random.random(),  # Would be real timestamp
                     additional_data={"method": "lidar", "distance": distance}
                 )
-                
+
                 self._add_feature(wall_feature)
-                
+
                 # Mark cells along the ray as explored (free space)
                 self._mark_ray_as_explored(drone_pos, (hit_x, hit_y))
     

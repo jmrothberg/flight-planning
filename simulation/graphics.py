@@ -217,40 +217,58 @@ class GraphicsEngine:
             pygame.draw.circle(self.screen, color, (int(pos[0]), int(pos[1])), 3)
     
     def draw_lidar_scan(self, drone, lidar_ranges, color=None):
-        """Draw LIDAR scan visualization - rays stop at walls.
-        
+        """Draw LIDAR scan visualization — STM 54×42 limited FoV cone.
+
         Args:
             drone: Drone object with position and orientation
-            lidar_ranges: List of LIDAR distances
+            lidar_ranges: dict (new STM format) or list (legacy)
             color: Optional RGB tuple for ray color (default: RED)
         """
         if not self.show_lidar or not lidar_ranges:
             return
-        
+
         ray_color = color if color else Colors.RED
-        
+
+        # Unpack new dict format or fall back to legacy list
+        if isinstance(lidar_ranges, dict):
+            ranges = lidar_ranges["ranges"]
+            start_angle = lidar_ranges["start_angle"]
+            angle_step = lidar_ranges["angle_step"]
+            hfov = lidar_ranges["hfov"]
+            max_range = 9.0
+        else:
+            ranges = lidar_ranges
+            start_angle = drone.orientation
+            angle_step = 2 * math.pi / len(ranges) if len(ranges) > 0 else 0
+            hfov = 2 * math.pi
+            max_range = 25.0
+
         drone_pos = self._world_to_screen(drone.position[:2])
-        angle_step = 2 * math.pi / len(lidar_ranges)
-        
-        # Subsample rays to reduce per-frame draw calls
-        step = max(1, len(lidar_ranges) // 120)  # draw ~120 rays
-        
-        for i in range(0, len(lidar_ranges), step):
-            distance = lidar_ranges[i]
-            # Skip max-range returns to avoid lines that appear to pass through walls
-            if distance >= 24.9:
+
+        # Draw FoV boundary lines (faint)
+        fov_color = (ray_color[0] // 3, ray_color[1] // 3, ray_color[2] // 3)
+        for boundary_angle in [start_angle, start_angle + hfov]:
+            bx = drone.position[0] + max_range * math.cos(boundary_angle)
+            by = drone.position[1] + max_range * math.sin(boundary_angle)
+            bp = self._world_to_screen((bx, by))
+            if drone_pos and bp:
+                pygame.draw.line(self.screen, fov_color, drone_pos, bp, 1)
+
+        # Draw each ray
+        for i, distance in enumerate(ranges):
+            # Skip max-range returns
+            if distance >= max_range - 0.1:
                 continue
-            
-            angle = drone.orientation + (i * angle_step)
-            # LIDAR endpoint is exactly where the ray stopped (at wall or max range)
+
+            angle = start_angle + i * angle_step
             end_x = drone.position[0] + distance * math.cos(angle)
             end_y = drone.position[1] + distance * math.sin(angle)
             end_pos = self._world_to_screen((end_x, end_y))
-            
+
             # Draw LIDAR ray
             if drone_pos and end_pos:
                 pygame.draw.line(self.screen, ray_color, drone_pos, end_pos, 1)
-            
+
             # Draw hit point (wall hit)
             if end_pos:
                 pygame.draw.circle(self.screen, ray_color, end_pos, 2)
