@@ -1933,11 +1933,17 @@ class DroneSimulation:
             self._finalize_video()
         self._video_frame_count = 0
         self._video_filename = "_recording_in_progress.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         w, h = self.window_size
+        # Use H.264 (avc1) — produces universally playable MP4 on macOS.
+        # mp4v (MPEG-4 Visual) creates files that QuickTime rejects as "broken".
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         self._video_writer = cv2.VideoWriter(self._video_filename, fourcc, 20, (w, h))
+        if not self._video_writer.isOpened():
+            # Fallback to mp4v if avc1 not available
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self._video_writer = cv2.VideoWriter(self._video_filename, fourcc, 20, (w, h))
         if self._video_writer.isOpened():
-            print(f"Video recording started ({w}x{h} @ 20fps)")
+            print(f"Video recording started ({w}x{h} @ 20fps, H.264)")
         else:
             print("WARNING: Failed to open video writer")
             self._video_writer = None
@@ -1959,7 +1965,10 @@ class DroneSimulation:
         """Finalize the video recording: release writer and rename to final filename."""
         if self._video_writer is None:
             return
-        self._video_writer.release()
+        try:
+            self._video_writer.release()
+        except Exception as e:
+            print(f"WARNING: Error releasing video writer: {e}")
         self._video_writer = None
 
         # Build final filename matching screenshot convention
