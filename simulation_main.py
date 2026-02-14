@@ -42,7 +42,7 @@ Controls:
 import pygame
 import sys
 import numpy as np
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, List, Optional, Dict, Set
 import time
 import math
 import cv2
@@ -168,8 +168,9 @@ class DroneSimulation:
         self._auto_screenshot_last = time.time()
         self._auto_start_time = time.time()
 
-        # Per-drone screenshots pending (saved after render)
-        self._pending_drone_screenshots: List[int] = []
+        # Per-drone screenshots: mid (at 180s sim) + done (at completion)
+        self._pending_drone_screenshots: List[Tuple[int, str]] = []  # (drone_id, tag)
+        self._drone_mid_screenshots_taken: Set[int] = set()
         # Per-drone frozen elapsed time at completion (for timer freeze)
         self._drone_completion_elapsed: Dict[int, float] = {}
 
@@ -296,6 +297,11 @@ class DroneSimulation:
                             continue  # Not yet entered building
                         elapsed_i = (now - st) * SIM_SPEED
 
+                        # 3 MINUTES (180s): per-drone mid-mission screenshot
+                        if elapsed_i >= 180.0 and i not in self._drone_mid_screenshots_taken:
+                            self._drone_mid_screenshots_taken.add(i)
+                            self._pending_drone_screenshots.append((i, "mid"))
+
                         # 6 MINUTES (360s): force return home
                         if elapsed_i >= 360.0 and not self.drone_manager.returning_home[i]:
                             self.drone_manager.returning_home[i] = True
@@ -312,7 +318,7 @@ class DroneSimulation:
                                 cov = search_i.get_coverage_stats().get('coverage_pct', 0)
                                 self._drone_completion_elapsed[i] = elapsed_i
                                 print(f"[BATTERY DEAD] Drone {i}: 7 min reached ({elapsed_i:.0f}s sim, {cov}% coverage)")
-                                self._pending_drone_screenshots.append(i)
+                                self._pending_drone_screenshots.append((i, "done"))
                         else:
                             all_dead = False
 
@@ -323,13 +329,18 @@ class DroneSimulation:
                         cov = self.drone_manager.get_global_coverage_stats()['coverage_pct']
                         print(f"ALL DRONES DONE. Global coverage: {cov}%")
                         print("=" * 50)
-                        self._save_screenshot("final_7min")
                         self._finalize_video()
                         self.mission_active = False
                         print("Press SPACE to start new mission, R to reset, ESC to exit")
                 else:
-                    # Single drone mode: original behavior
+                    # Single drone mode = D0 running alone (same screenshot logic)
                     simulated_elapsed = (time.time() - self._start_time) * SIM_SPEED
+
+                    # D0 mid screenshot at 180s sim (3 min)
+                    if simulated_elapsed >= 180.0 and 0 not in self._drone_mid_screenshots_taken:
+                        self._drone_mid_screenshots_taken.add(0)
+                        self._pending_drone_screenshots.append((0, "mid"))
+
                     if simulated_elapsed >= 420.0 and not getattr(self, '_time_limit_reached', False):
                         self._time_limit_reached = True
                         print("=" * 50)
@@ -337,20 +348,11 @@ class DroneSimulation:
                         cov = self.search_algorithm.get_coverage_stats().get('coverage_pct', 0)
                         print(f"Final coverage: {cov}%")
                         print("=" * 50)
-                        self._save_screenshot("final_7min")
+                        self._pending_drone_screenshots.append((0, "done"))
                         self._finalize_video()
                         self.mission_active = False
                         self.drone.emergency_stop()
                         print("Press SPACE to start new mission, R to reset, ESC to exit")
-
-            # AUTO-SCREENSHOT: Take mid-mission screenshot at 3.5 minutes simulated
-            if not hasattr(self, '_mid_screenshot_taken'):
-                self._mid_screenshot_taken = False
-            if self.mission_active and self._start_time is not None and not self._mid_screenshot_taken:
-                simulated_elapsed = (time.time() - self._start_time) * SIM_SPEED
-                if simulated_elapsed >= 210.0:  # Half of 7 minutes
-                    self._save_screenshot("mid_3_5min")
-                    self._mid_screenshot_taken = True
             
             if self.mission_active:
                 # Update core systems (may set mission_active=False if drone arrives home)
@@ -369,7 +371,6 @@ class DroneSimulation:
                     print("=" * 50)
                     print("MISSION COMPLETE! All drones returned HOME.")
                     print("=" * 50)
-                    self._save_screenshot("final_complete")
                     self._finalize_video()  # Save video recording
                     print("Press SPACE to start new mission, R to reset, ESC to exit")
 
@@ -690,7 +691,7 @@ class DroneSimulation:
                 print("=" * 50)
                 print("HOME! Mission complete - drone returned to start.")
                 print("=" * 50)
-                self._save_screenshot("mission_complete")
+                self._pending_drone_screenshots.append((0, "done"))
                 self._finalize_video()  # Save video recording
                 print("Press SPACE to start new mission, R to reset, ESC to exit")
                 # DON'T exit - wait for user input
@@ -1252,8 +1253,8 @@ class DroneSimulation:
             self._record_frame()
 
         # Save pending per-drone screenshots (after render so screen is current)
-        for drone_id in self._pending_drone_screenshots:
-            self._save_drone_screenshot(drone_id)
+        for drone_id, tag in self._pending_drone_screenshots:
+            self._save_drone_screenshot(drone_id, tag)
         self._pending_drone_screenshots.clear()
     
     def _setup_multi_drone(self, preserve_drone_0: bool = False):
@@ -1578,7 +1579,7 @@ class DroneSimulation:
                         if start_t:
                             self._drone_completion_elapsed[i] = (time.time() - start_t) * SIM_SPEED
                         print(f"Drone {i} mission complete! Coverage: {cov}%")
-                        self._pending_drone_screenshots.append(i)
+                        self._pending_drone_screenshots.append((i, "done"))
 
                 # Try A* to home first; if it fails, use intermediate hops
                 target = home
@@ -2024,7 +2025,7 @@ class DroneSimulation:
         self._entry_wp_time = time.time()
         self._return_msg_printed = False
         self._time_limit_reached = False
-        self._mid_screenshot_taken = False
+        self._drone_mid_screenshots_taken.clear()
         self._drone_completion_elapsed.clear()
         self._pending_drone_screenshots.clear()
 
@@ -2053,8 +2054,8 @@ class DroneSimulation:
         self.search_algorithm.reset()  # Reset search algorithm for new mission
         self.drone.mission_complete = False
         self._time_limit_reached = False
-        self._mid_screenshot_taken = False
-    
+        self._drone_mid_screenshots_taken.clear()
+
     def _cleanup(self):
         """Cleanup resources."""
         self._finalize_video()  # Save any in-progress recording
@@ -2085,17 +2086,24 @@ class DroneSimulation:
         except Exception as e:
             print(f"Error saving screenshot: {e}")
 
-    def _save_drone_screenshot(self, drone_id: int):
-        """Save screenshot when a specific drone returns home."""
-        if not self.drone_manager:
-            return
-        search = self.drone_manager.get_search(drone_id)
+    def _save_drone_screenshot(self, drone_id: int, tag: str = "done"):
+        """Save per-drone screenshot. Works for both single and multi-drone.
+
+        Tags: 'mid' (at 3 min), 'done' (at completion/death)
+        Filename: d{id}_{tag}_{mm}m{ss}s_{cov}pct.png
+        """
+        if self.multi_drone_mode and self.drone_manager:
+            search = self.drone_manager.get_search(drone_id)
+            start_t = self.drone_manager.mission_start_times[drone_id]
+        else:
+            # Single drone = D0
+            search = self.search_algorithm
+            start_t = self._start_time
         cov = search.get_coverage_stats()['coverage_pct']
-        start_t = self.drone_manager.mission_start_times[drone_id]
         elapsed = int((time.time() - start_t) * SIM_SPEED) if start_t else 0
         mm = elapsed // 60
         ss = elapsed % 60
-        filename = f"d{drone_id}_done_{mm}m{ss:02d}s_{cov}pct.png"
+        filename = f"d{drone_id}_{tag}_{mm}m{ss:02d}s_{cov}pct.png"
         try:
             pygame.image.save(self.graphics.screen, filename)
             print(f"Saved: {filename}")

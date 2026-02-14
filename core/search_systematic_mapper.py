@@ -541,19 +541,18 @@ class SystematicMapper:
                 dist += 15
 
             # Multi-drone: prefer cells FAR from other drones (spatial separation)
-            # Only penalize if NO wall between us and the other drone (line-of-sight)
-            if self.other_drone_positions and self._last_position:
+            # Uses only shared position data (from gossip/radio) — no pre-knowledge.
+            # Apply penalty even through walls: drones in different rooms should
+            # still push apart so they explore different areas of the building.
+            # The richness bonus (-22 max) ensures wall-adjacent cells still get
+            # explored eventually, just with lower priority.
+            if self.other_drone_positions:
                 wx = c[0] * self.grid_size + self.grid_size / 2
                 wy = c[1] * self.grid_size + self.grid_size / 2
                 for op in self.other_drone_positions:
                     d = math.hypot(wx - op[0], wy - op[1])
-                    if d < 15.0:
-                        # Skip penalty if a wall separates us from the other drone
-                        if self._has_wall_between(
-                                self._last_position[0], self._last_position[1],
-                                op[0], op[1]):
-                            continue
-                        dist += (15.0 - d) * 1.3  # Up to +20 penalty at 0m
+                    if d < 20.0:
+                        dist += (20.0 - d) * 0.8  # Up to +16 penalty at 0m
 
             # Sweep preference — continue current direction
             if self.last_sweep_direction and len(self.last_searched_cells) >= 2:

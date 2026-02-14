@@ -67,7 +67,7 @@ score = bfs_distance (through free cells, respects walls)
       - min(richness*0.7, 22)  REGION RICHNESS: unsearched cells in 3-cell radius (ALL candidates)
       + 2   if wall cell
       + 15  if claimed by another drone
-      + (15-d)*1.3  if within 15m of another drone AND no wall between (wall-aware!)
+      + (20-d)*0.8  if within 20m of another drone (pushes apart even through walls)
       - 1.5 if continues current sweep direction
       - 1.0 if adjacent to recently searched cell
       - 0.5*N if rush mode (N = unsearched neighbors count)
@@ -110,13 +110,14 @@ Per-drone (independent timers, start when drone LAUNCHES — first frame):
 - Mission ends when ALL drones are either home or dead
 - Video saved once at mission end
 
-### Multi-Drone Spatial Penalty (Wall-Aware)
-- Penalty only applies if there is NO wall between the current drone and the
-  other drone (checked via Bresenham grid walk through wall_cells)
-- If a wall separates two drones, they are in different rooms and should NOT
-  penalize each other's target selection
-- Without this, a drone in room A avoids searching cells near the shared wall
-  because drone B is on the other side — even though B can't reach those cells
+### Multi-Drone Spatial Penalty (Distance-Based)
+- Penalty applies within 20m based on Euclidean distance to other drones
+- Applied EVEN through walls — drones in different rooms still push apart
+  so they explore different areas of the building
+- The richness bonus (-22 max) ensures wall-adjacent cells still get explored
+- Uses only shared sensor data (positions from radio) — no pre-knowledge
+- CRITICAL: Never use building layout knowledge for search decisions.
+  Drones must navigate using ONLY what they discover via LiDAR.
 
 ### Global Coverage Calculation
 - Uses search algorithm data directly (`search.searched_cells`, `search.free_cells`)
@@ -202,15 +203,22 @@ at corners and aims at a point behind the wall.
 follows corners (falls back to stride 1 at turns).
 **NEVER:** Use a fixed stride. It will ALWAYS fail at either doors or corners.
 
-### Bug: Multi-Drone Spatial Penalty Through Walls
+### Bug: Multi-Drone Drones Not Spreading Apart
 **File:** `core/search_systematic_mapper.py`, `cell_score()` spatial penalty
-**Symptom:** Drone in room A refuses to search cells near wall because drone B
-is on the other side. Both drones do nothing near the shared wall.
-**Root cause:** `math.hypot` distance ignores walls. Two drones 3m apart but
-separated by a wall were penalizing each other's targets by +15.6 points.
-**Fix:** `_has_wall_between()` Bresenham grid walk checks for wall cells on the
-line between two drones. If wall found, skip spatial penalty entirely.
-**NEVER:** Use Euclidean distance alone for spatial penalty. Always check walls.
+**Symptom:** Drones go to same rooms instead of splitting up across building.
+**Root cause (original V11.7):** Wall check in spatial penalty skipped the penalty
+when drones were in different rooms. Drones in adjacent rooms had zero incentive
+to explore different areas. Combined with stale gossip (out of comm range), both
+drones targeted the same unexplored regions.
+**Root cause (V11.7 wall-check fix):** Wall check was too conservative — ANY wall
+cell on the line between drones disabled the penalty, even if drones could reach
+each other through doors. Drones still clustered.
+**Fix (V11.9):** Removed wall check entirely. Penalty applies within 20m based
+purely on Euclidean distance. Strength reduced from 1.3 to 0.8 per meter to
+compensate (max +16 at 0m). The richness bonus (-22) ensures wall-adjacent cells
+still get explored, just with lower priority than cells far from the other drone.
+**NEVER:** Use pre-programmed building knowledge (zones, sectors) for separation.
+Drones must decide using ONLY LiDAR-discovered data + shared positions.
 
 ### Bug: Global Coverage 12% (should be ~60%)
 **File:** `core/drone_manager.py`, `get_global_coverage_stats()`
