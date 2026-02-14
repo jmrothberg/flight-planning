@@ -1,60 +1,48 @@
 """
-Search Method: Efficient Grid Coverage
-VERSION: 11.6a - Fixed entry oscillation bug + better timing
+Search Algorithm: BFS-Distance Frontier Exploration + Grid Coverage
+VERSION: 11.8
 
 === CRITICAL: MUST RETURN HOME OR ALL DATA IS LOST ===
 
-KEY PARAMETERS (V11.6a):
-- Return speed assumption: 1.2 m/s 
-- Safety margin: 70 seconds
-- Formula: time_to_return = distance / 1.2 + 70
-- Simple formula that doesn't scale badly at far distances
+SEARCH STRATEGY:
+All unsearched free cells reachable via BFS through known free space are
+scored. BFS distance (not Manhattan) ensures the drone never targets cells
+behind walls. Frontier cells (adjacent to unknown space — doorways, room
+edges) get a -8 bonus with extra doorway detection. Wall-adjacent cells get
+a +2 penalty. Unreachable cells are automatically excluded.
 
-V11.6 BUG FIXES:
-- entry_point was inside building (y≈2), but mission_complete needs y<-2
-- New: exit_point set to START position (y=-3) - drone returns to where it started
-- Return timing formula simplified - V11.6 formula scaled badly at far distances
+MULTI-DRONE:
+- global_searched (from gossip) prevents re-scanning another drone's work
+- global_free motivates exploring areas discovered by others
+- claimed_by_others (+15 penalty) prevents two drones targeting the same cell
+- Spatial separation penalty keeps drones apart
 
-SIMULATED TIME:
-- Simulation runs at SIM_SPEED (3x real time)
-- Search algorithm receives simulated time via set_simulated_time()
-- All timing logic uses self.simulated_elapsed, NOT time.time()
-
-SEARCH STRATEGY (V11.6 - optimized for complete coverage):
-1. Visit nearest UNSEARCHED cell with SWEEP PREFERENCE
-2. Prefer cells that continue current sweep direction (avoid zigzag)
-3. Prefer cells adjacent to recently-searched cells (complete regions)
-4. Rush mode (>180s simulated): Stronger bonus for clustered unsearched cells
-5. Return when time_remaining < time_to_return (now less conservative)
-
-=== FOR NEXT LLM: WHAT FAILED ===
-- Angular partitioning: angles are relative, change as drone moves
-- Euclidean world coords: broke single drone pathfinding  
-- Position-based repulsion: caused oscillation with multiple drones
-- time.time(): wrong time base - need SIMULATED time
-- V11.5h (1.0m/s + 90s): TOO conservative, only got 81% coverage
-
-=== WHAT WORKS ===
-- Manhattan distance in GRID coordinates for frontier scoring
-- Simple claim system (+5 penalty) for multi-drone coordination
-- Sweep preference (continue in same direction)
-- Region completion (adjacent to recently searched = bonus)
-- Distance-adaptive return margin
+KEY PARAMETERS:
+- Grid: 2m cells (matches 2m IED detector range)
+- Return: speed 1.2 m/s, safety = min(70s, 20 + dist*2)
+- Stuck: blacklist cell for 8s after 1s of no progress
+- Drone: 0.2m square, 0.2m wall clearance
+- LiDAR: 59° HFoV, 9m range, rotation scans every 1.5s for 360° awareness
 """
 
 from typing import List, Tuple, Optional, Set, Dict
+from collections import deque
 import math
 import time
 
 class SystematicMapper:
     """
-    Efficient grid-based coverage with multi-drone coordination.
-    Based on V9 which achieved 92% - keeping what worked, improving efficiency.
+    Grid-based IED search with bonus-based frontier exploration.
+    Single drone or multi-drone (via gossip protocol coordination).
     """
     
-    def __init__(self, coverage_radius: float = 3.0, drone_id: int = 0, **kwargs):
-        self.grid_size = 3.0  # 3m grid matches IED detector range
+    def __init__(self, coverage_radius: float = 2.0, drone_id: int = 0,
+                 building_width: float = 25.0, building_height: float = 25.0, **kwargs):
+        self.grid_size = 2.0  # 2m grid matches IED detector range
         self.drone_id = drone_id  # For multi-drone identification
+        # Building bounds (in grid coords) — don't mark cells outside as free
+        self.max_grid_x = int(building_width / self.grid_size)
+        self.max_grid_y = int(building_height / self.grid_size)
         
         # Grid tracking (local to this drone)
         self.free_cells: Set[Tuple[int, int]] = set()
@@ -72,53 +60,51 @@ class SystematicMapper:
         # Cells claimed by other drones (avoid these)
         self.claimed_by_others: Set[Tuple[int, int]] = set()
         
-        # V11.4: Other drones' current positions (for spatial separation)
-        # Key insight: prefer frontiers FAR from other drones
+        # Other drones' current positions (for spatial separation penalty)
         self.other_drone_positions: List[Tuple[float, float]] = []
-        
+
         # Target persistence - don't change target every frame
-        # V11.5d: Moderate - balance between responsiveness and stability
         self.target_persistence_time: float = 0.0
-        self.min_target_hold_time: float = 1.0  # Hold target for 1.0 seconds
-        
+        self.min_target_hold_time: float = 1.5  # Hold target for 1.5 simulated seconds
+
         # Stuck detection - track recent positions
-        # V11.5d: Less aggressive - give drone time to navigate obstacles
         self.position_history: List[Tuple[float, float]] = []
         self.last_position_time: float = 0.0
-        self.position_sample_interval: float = 0.3  # Sample every 0.3s
-        self.stuck_threshold: float = 1.5  # Consider stuck if moved < 1.5m
+        self.position_sample_interval: float = 0.4  # Sample every 0.4 simulated seconds
+        self.stuck_threshold: float = 0.8  # Consider stuck if moved < 0.8m
         
         # Oscillation detection - track recent target cells
         self.recent_targets: List[Tuple[int, int]] = []
         self.max_recent_targets: int = 10
         
         # Failed targets - temporarily blacklist unreachable targets
-        # V11.5d: Moderate timeout - balance retry speed vs stability
         self.failed_targets: Dict[Tuple[int, int], float] = {}  # cell -> failure_time
-        self.failed_target_timeout: float = 12.0  # Blacklist for 12 seconds
+        self.failed_target_timeout: float = 15.0  # Blacklist for 15 simulated seconds
         
         # Current target
         self.target: Optional[Tuple[float, float]] = None
         self.target_cell: Optional[Tuple[int, int]] = None
         
-        # Timing for efficiency
+        # Timing
         self.start_time: Optional[float] = None
         self.entry_point: Optional[Tuple[float, float]] = None
-        # V11.6a: Separate exit point (START position) for return - fixes oscillation bug
-        # entry_point = where we started exploring (inside, y≈2)
         # exit_point = START position (y=-3) where drone began, must return there
+        # entry_point = where drone entered building (inside, y≈2)
         self.exit_point: Optional[Tuple[float, float]] = None
-        
-        # V11.6: Simulated time (passed from simulation, not calculated internally)
+
+        # Simulated time (passed from simulation_main, not calculated internally)
         self.simulated_elapsed: float = 0.0
         self._mode: str = "SEARCH"  # SEARCH, RUSH, or RETURN for UI display
+
+        # Sweep direction tracking for boustrophedon-style coverage
+        self.last_sweep_direction: Optional[Tuple[int, int]] = None
+        self.last_searched_cells: List[Tuple[int, int]] = []
+        self.max_recent_searched: int = 20
         
-        # V11.6: Track sweep direction for boustrophedon-style coverage
-        self.last_sweep_direction: Optional[Tuple[int, int]] = None  # (dx, dy) of last move
-        self.last_searched_cells: List[Tuple[int, int]] = []  # Recent cells for region completion
-        self.max_recent_searched: int = 20  # Track last N searched cells
-        
-        print(f"SYSTEMATIC_MAPPER V11.6a: Drone {drone_id} - fixed entry oscillation + better timing")
+        self._last_position = None
+        self._needs_rotation_scan = False
+        self._no_frontier_logged = False
+        print(f"SYSTEMATIC_MAPPER V11.8: Drone {drone_id} - frontier-first exploration for arbitrary buildings")
 
     def get_next_waypoint(self, position: Tuple[float, float], 
                          lidar_ranges: List[float], 
@@ -127,39 +113,31 @@ class SystematicMapper:
         
         px, py = position
         
-        # Initialize entry point when drone enters building
-        if self.entry_point is None and py > 2:
+        # Initialize entry point when drone enters building (y >= 1.0 = inside)
+        if self.entry_point is None and py >= 1.0:
             self.entry_point = (px, py)
-            # V11.6a: Set exit_point to START position (where drone began, outside building)
-            # Drone starts at y=-3 (outside), enters through door at y=0
-            # Must return to start position, not just the door
             self.exit_point = (px, -3.0)
         
         # Track position for debug info
         self._last_position = (px, py)
         
-        # V11.5h: Use SIMULATED time, VERY conservative return timing
         elapsed = self.simulated_elapsed
         time_limit = 420.0  # 7 minutes simulated
         time_remaining = time_limit - elapsed
         
-        # CRITICAL: Distance-based return - MUST make it back or data is lost!
-        # V11.6a: Balanced timing with simple formula, return to EXIT (not entry)
+        # Distance-based return - MUST make it back or data is lost!
         if self.exit_point:
             dist_to_exit = math.hypot(px - self.exit_point[0], py - self.exit_point[1])
-            # V11.6a: Simple formula that doesn't scale badly
-            # 1.2 m/s effective speed + 70s margin
-            # At 10m: 78s, at 20m: 87s, at 30m: 95s (reasonable scaling)
-            time_to_return = dist_to_exit / 1.2 + 70.0
+            # Safety margin scales with distance: 20s base + 2s per meter, capped at 70s
+            safety = min(70.0, 20.0 + dist_to_exit * 2.0)
+            time_to_return = dist_to_exit / 1.2 + safety
             
             if time_remaining < time_to_return:
                 if not getattr(self, '_return_announced', False):
                     cov = self.get_coverage_stats()['coverage_pct']
                     print(f"[RETURN] D{self.drone_id}: {int(elapsed)}s sim, {cov:.0f}% coverage, {dist_to_exit:.0f}m to exit")
                     self._return_announced = True
-                # Set mode for UI display
                 self._mode = "RETURN"
-                # V11.6a: Return to EXIT point (door), not entry point (inside)
                 return self.exit_point
         
         # Update map from LIDAR
@@ -169,59 +147,60 @@ class SystematicMapper:
         curr_cell = self._to_grid(px, py)
         if curr_cell in self.free_cells:
             self.searched_cells.add(curr_cell)
-            # V11.6: Track recently searched cells for region completion preference
             if not self.last_searched_cells or self.last_searched_cells[-1] != curr_cell:
                 self.last_searched_cells.append(curr_cell)
                 if len(self.last_searched_cells) > self.max_recent_searched:
                     self.last_searched_cells = self.last_searched_cells[-self.max_recent_searched:]
         
-        # Also mark nearby cells as searched (IED detector covers 3m radius)
-        # BUT only if no wall blocks line-of-sight to that cell
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                neighbor = (curr_cell[0] + dx, curr_cell[1] + dy)
-                if neighbor not in self.free_cells:
-                    continue  # Not a free cell, skip
-                if neighbor in self.wall_cells:
-                    continue  # Is a wall, skip
-                    
-                # For diagonal neighbors, check that we can reach them
-                # (not blocked by walls on cardinal directions)
-                if dx != 0 and dy != 0:
-                    # Diagonal: must be able to go around either way
-                    cardinal1 = (curr_cell[0] + dx, curr_cell[1])
-                    cardinal2 = (curr_cell[0], curr_cell[1] + dy)
-                    if cardinal1 in self.wall_cells and cardinal2 in self.wall_cells:
-                        continue  # Both paths blocked, can't reach diagonal
-                
-                self.searched_cells.add(neighbor)
+        # Also mark CARDINAL neighbors as searched (IED detector 2m range).
+        # Diagonal neighbors are 2.83m away (center-to-center on 2m grid) = OUT OF RANGE.
+        # Wall check: skip if EITHER curr_cell or neighbor is a wall cell.
+        # Wall LiDAR endpoints can land in either cell at the boundary — checking
+        # both sides ensures IED detection never "reaches through" a wall.
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            neighbor = (curr_cell[0] + dx, curr_cell[1] + dy)
+            if neighbor not in self.free_cells:
+                continue
+            if neighbor in self.wall_cells:
+                continue  # Wall endpoint in neighbor cell
+            if curr_cell in self.wall_cells:
+                continue  # Wall endpoint in our cell — wall might face this neighbor
+            self.searched_cells.add(neighbor)
         
         # Check if we reached target
         if self.target:
             dist = math.hypot(px - self.target[0], py - self.target[1])
             if dist < 2.5:
+                # If we're close but the cell wasn't actually searched
+                # (wall between us and the target), blacklist it so we don't
+                # loop forever picking the same unreachable cell.
+                if self.target_cell and self.target_cell not in self.searched_cells:
+                    self.failed_targets[self.target_cell] = self.simulated_elapsed
                 self.target = None
                 self.target_cell = None
         
         # Find next target if needed
         if self.target is None:
-            # V11.6: Earlier rush mode (180s instead of 200s) for better late-game coverage
             rush_mode = elapsed > 180
             self._mode = "RUSH" if rush_mode else "SEARCH"
             self.target = self._find_best_target(px, py, rush_mode)
         
         if self.target:
             return self.target
-        
-        # No more targets - return to exit
-        # V11.6a: Return to EXIT point (door at y=-0.5), not entry point (inside)
-        if self.exit_point:
-            return self.exit_point
-        elif self.entry_point:
-            return self.entry_point
-        
-        # Fallback: move forward
-        return (px + 2 * math.cos(orientation), py + 2 * math.sin(orientation))
+
+        # No targets found by _find_best_target.
+        # If mission is genuinely complete (all free cells searched), return to exit.
+        if self.is_mission_complete():
+            self._mode = "RETURN"
+            if self.exit_point:
+                return self.exit_point
+            elif self.entry_point:
+                return self.entry_point
+
+        # NOT complete but no targets — return None so caller triggers rotation scan.
+        # This is critical: returning exit_point here would send the drone BACK OUTSIDE
+        # and the rotation scan (which discovers new cells) would never trigger.
+        return None
 
     def _update_map(self, px: float, py: float, lidar, ori: float):
         """Update grid map from LIDAR scan.
@@ -251,7 +230,9 @@ class SystematicMapper:
             angle = start_angle + i * angle_step
             dist = min(dist, max_range)
 
-            # Mark cells along ray as FREE
+            # Mark cells along ray as FREE (ray passes through = confirmed free)
+            # Don't touch wall_cells — both sets are independent.
+            # A cell can be in BOTH sets (doorway edge: wall nearby but navigable).
             ray_steps = int(dist / (self.grid_size / 2))
             for s in range(ray_steps):
                 r = s * (self.grid_size / 2)
@@ -259,16 +240,27 @@ class SystematicMapper:
                 ry = py + r * math.sin(angle)
                 cell = self._to_grid(rx, ry)
 
-                if cell not in self.wall_cells and cell[1] >= 0:
+                if (cell[1] >= 0 and cell[0] >= 0 and
+                    cell[0] < self.max_grid_x and cell[1] < self.max_grid_y):
                     self.free_cells.add(cell)
 
-            # Mark endpoint as WALL
+            # Mark endpoint as WALL (don't touch free_cells).
+            # Both sets independent: doorway cells can be in both.
             if dist < max_range - 1.0:
                 wx = px + dist * math.cos(angle)
                 wy = py + dist * math.sin(angle)
                 wall_cell = self._to_grid(wx, wy)
                 self.wall_cells.add(wall_cell)
-                self.free_cells.discard(wall_cell)
+
+    def feed_lidar_scan(self, px: float, py: float, lidar, orientation: float):
+        """Feed an additional LiDAR scan into the search algorithm's internal map.
+
+        This MUST be called for every rotation scan so the search algorithm
+        discovers doorways and rooms outside the forward 59° FoV cone.
+        Without this, the drone only sees what's directly ahead and runs
+        out of frontiers prematurely.
+        """
+        self._update_map(px, py, lidar, orientation)
 
     def set_global_searched(self, global_cells: Set[Tuple[int, int]]):
         """
@@ -300,186 +292,311 @@ class SystematicMapper:
         self.claimed_by_others = claimed_cells.copy()
     
     def set_other_drone_positions(self, positions: List[Tuple[float, float]]):
-        """
-        Set current positions of OTHER drones (not used in V11.5e+, kept for compatibility).
-        """
+        """Set current positions of OTHER drones (used for spatial separation penalty)."""
         self.other_drone_positions = list(positions)
+
+    def _has_wall_between(self, x1: float, y1: float, x2: float, y2: float) -> bool:
+        """Check if any wall cell lies on the grid-line between two world positions.
+
+        Uses Bresenham-style grid walk to detect walls separating two drones.
+        If a wall is between them, the spatial separation penalty should NOT apply
+        because the drones can't actually reach each other's area.
+        """
+        g = self.grid_size
+        gx1, gy1 = int(x1 // g), int(y1 // g)
+        gx2, gy2 = int(x2 // g), int(y2 // g)
+        dx = abs(gx2 - gx1)
+        dy = abs(gy2 - gy1)
+        sx = 1 if gx2 > gx1 else -1
+        sy = 1 if gy2 > gy1 else -1
+        err = dx - dy
+        cx, cy = gx1, gy1
+        steps = 0
+        max_steps = dx + dy + 2
+        while steps < max_steps:
+            if (cx, cy) in self.wall_cells:
+                return True
+            if cx == gx2 and cy == gy2:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                cx += sx
+            if e2 < dx:
+                err += dx
+                cy += sy
+            steps += 1
+        return False
     
     def set_simulated_time(self, elapsed_seconds: float):
-        """
-        V11.5g: Set the simulated elapsed time (called by simulation_main).
-        
-        CRITICAL: The search algorithm must use SIMULATED time, not real wall-clock time.
-        The simulation runs at SIM_SPEED (e.g., 3x), so 140 real seconds = 420 simulated.
-        
-        Args:
-            elapsed_seconds: Simulated seconds since mission start
+        """Set the simulated elapsed time (called by simulation_main each frame).
+
+        Uses SIMULATED time, not wall-clock. SIM_SPEED=3x means 140 real = 420 sim.
         """
         self.simulated_elapsed = elapsed_seconds
     
+    def mark_target_unreachable(self):
+        """Immediately blacklist the current target and clear it.
+
+        Called by simulation_main when A* pathfinding returns an empty path,
+        so the search algorithm retargets instantly instead of waiting for
+        slow stuck detection (which takes ~4.5s of wasted time).
+        """
+        if self.target_cell:
+            self.failed_targets[self.target_cell] = self.simulated_elapsed
+            self.target_cell = None
+            self.target = None
+
+    def _compute_bfs_distances(self, start_cell: Tuple[int, int]) -> Dict[Tuple[int, int], int]:
+        """BFS flood-fill from start_cell through free_cells.
+
+        Returns dict mapping each reachable cell to its BFS distance (in grid steps).
+        Cells behind walls (not connected through free space) are simply absent
+        from the result, which automatically excludes them as targets.
+        """
+        distances: Dict[Tuple[int, int], int] = {start_cell: 0}
+        queue = deque([start_cell])
+        # BFS through cells that are free (navigable)
+        # wall_cells are NOT excluded — they may be navigable (doorway edges).
+        # Only cells NOT in free_cells are impassable.
+        navigable = self.free_cells | self.global_free
+
+        while queue:
+            cell = queue.popleft()
+            d = distances[cell] + 1
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                neighbor = (cell[0] + dx, cell[1] + dy)
+                if neighbor not in distances and neighbor in navigable:
+                    distances[neighbor] = d
+                    queue.append(neighbor)
+        return distances
+
     def _find_best_target(self, px: float, py: float, rush_mode: bool) -> Optional[Tuple[float, float]]:
         """Find best unsearched cell to visit.
-        
-        V11.2: Each drone acts like single drone, but:
-        - Uses global_searched to skip cells already searched by ANY drone
-        - Yields target if another drone claimed it (no competition)
-        - Skips cells already claimed by others when picking new target
+
+        Single-list nearest-unsearched with exploration bonus:
+        - All unsearched free cells are candidates (never starved of targets)
+        - Cells adjacent to unknown space get a bonus (discovers new rooms)
+        - Sweep preference and region completion for efficient coverage
+        - Multi-drone: global_searched prevents duplication, claimed gets penalty
         """
         curr_cell = self._to_grid(px, py)
-        now = time.time()
-        
-        # Update position history for stuck detection
+        now = self.simulated_elapsed
+
+        # Update position history for stuck detection (using simulated time)
         if now - self.last_position_time >= self.position_sample_interval:
             self.position_history.append((px, py))
             self.last_position_time = now
             if len(self.position_history) > 10:
                 self.position_history = self.position_history[-10:]
-        
-        # Check if stuck (hasn't moved much in recent history)
+
+        # Check if stuck
         is_stuck = False
         if len(self.position_history) >= 5:
             old_pos = self.position_history[-5]
             dist_moved = math.hypot(px - old_pos[0], py - old_pos[1])
             is_stuck = dist_moved < self.stuck_threshold
-        
-        # Clean up expired failed targets
+
+        # Clean up expired failed targets (using simulated time)
         expired = [c for c, t in self.failed_targets.items() if now - t > self.failed_target_timeout]
         for c in expired:
             del self.failed_targets[c]
-        
+
         # What's been searched? Use global if available (other drones' work)
         searched_set = self.global_searched if self.global_searched else self.searched_cells
-        
+
         # ============================================================
-        # CRITICAL: TARGET PERSISTENCE - DO NOT REMOVE OR MODIFY
-        # Without this, drones oscillate between targets every frame
-        # The drone must STICK to its target until:
-        #   1. Target reached (dist < 2.0)
-        #   2. Stuck for 3+ seconds (can't reach it)
-        #   3. Target already searched by someone else
-        #   4. Target in failed list
-        #   5. V11.2 FIX: Another drone claimed the same target
+        # TARGET PERSISTENCE — prevents oscillation between targets
         # ============================================================
         if self.target_cell and self.target:
             dist_to_target = math.hypot(px - self.target[0], py - self.target[1])
             time_on_target = now - self.target_persistence_time
-            
-            # Check if target still valid
+
             target_reached = dist_to_target < 2.0
             target_searched = self.target_cell in searched_set
             target_failed = self.target_cell in self.failed_targets
-            # V11.2 FIX: If another drone claimed this target, yield to them
             target_claimed_by_other = self.target_cell in self.claimed_by_others
-            
-            # If stuck for >2.5s on same target, blacklist it
-            if is_stuck and time_on_target > 2.5:
-                print(f"Drone {self.drone_id}: STUCK on target, blacklisting {self.target_cell}")
+
+            if is_stuck and time_on_target > self.min_target_hold_time:
+                # Blacklist just this cell (not neighbors — too aggressive)
                 self.failed_targets[self.target_cell] = now
                 self.target_cell = None
                 self.target = None
-            # V11.2 FIX: If another drone claimed our target, abandon it and pick new
             elif target_claimed_by_other:
                 self.target_cell = None
                 self.target = None
-            # KEEP current target if still valid (not reached, not searched, not failed)
             elif not target_reached and not target_searched and not target_failed:
                 return self.target  # STICK WITH CURRENT TARGET
-        
-        # ===== FRONTIER SELECTION (like single drone) =====
-        # Pick nearest unsearched cell, but skip cells claimed by other drones
-        
-        # Combine ALL known frontiers (mine + shared from gossip)
-        all_frontiers = []
-        
-        # My frontiers - cells I've seen that aren't searched yet
+
+        # ===== COLLECT ALL UNSEARCHED FREE CELLS =====
+        # Include ALL free cells (wall_cells too — _to_world offsets them).
+        # Wall cells get a small penalty in scoring, not hard exclusion.
+        # Hard exclusion starved the drone of targets (56% were wall cells!).
+        all_candidates = []
         for c in self.free_cells:
-            if (c not in searched_set and c[1] >= 0 and 
-                c not in self.failed_targets):
-                all_frontiers.append(c)
-        
-        # Other drones' frontiers (from gossip) - cells they've seen
+            if (c not in searched_set and c[1] >= 0 and
+                    c not in self.failed_targets):
+                all_candidates.append(c)
+
+        # Also include global_free from other drones
         if self.global_free:
             for c in self.global_free:
-                if (c not in searched_set and c[1] >= 0 and 
+                if (c not in searched_set and c[1] >= 0 and
                     c not in self.failed_targets and c not in self.free_cells):
-                    all_frontiers.append(c)
-        
-        if not all_frontiers:
-            # Debug: show why no frontiers found
-            if len(self.free_cells) == 0 and (not self.global_free or len(self.global_free) == 0):
-                print(f"D{self.drone_id}: No free cells known (local or global)")
-            else:
-                local_unsearched = len([c for c in self.free_cells if c not in searched_set])
-                global_unsearched = len([c for c in (self.global_free or set()) if c not in searched_set and c not in self.free_cells])
-                print(f"D{self.drone_id}: 0 frontiers (local unsearched: {local_unsearched}, global unsearched: {global_unsearched}, failed: {len(self.failed_targets)})")
+                    all_candidates.append(c)
+
+        if not all_candidates:
+            interior_free = len([c for c in self.free_cells if c[1] >= 0])
+            if not getattr(self, '_no_frontier_logged', False):
+                print(f"D{self.drone_id}: 0 targets ({interior_free} free, {len(self.failed_targets)} failed) — need rotation scan")
+                self._no_frontier_logged = True
+            self._needs_rotation_scan = True
             return None
-        
-        # V11.6: Optimized scoring with sweep preference and region completion
-        def frontier_score(c):
-            # Base score: Manhattan distance in GRID coordinates (ORIGINAL WORKING LOGIC)
-            dist = abs(c[0] - curr_cell[0]) + abs(c[1] - curr_cell[1])
-            
-            # Small penalty for cells claimed by other drones (not blocking, just preference)
+
+        # Compute BFS distances from drone's current cell through free space.
+        # Cells unreachable through known free space get no BFS distance,
+        # which automatically excludes them as candidates (no more wall-bumping).
+        bfs_distances = self._compute_bfs_distances(curr_cell)
+
+        # Filter candidates to only BFS-reachable cells
+        reachable_candidates = [c for c in all_candidates if c in bfs_distances]
+
+        # If no reachable candidates, fall back to all candidates with Manhattan
+        # (can happen early when map is sparse)
+        use_bfs = len(reachable_candidates) > 0
+        candidates = reachable_candidates if use_bfs else all_candidates
+
+        # Pre-compute exploration frontiers (adjacent to truly unknown space)
+        # Use combined free knowledge so gossip-known cells aren't "unknown"
+        combined_free = self.free_cells | self.global_free
+        exploration_cells = {}  # cell -> count of unknown neighbors
+        for c in candidates:
+            unknown_count = 0
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                neighbor = (c[0] + dx, c[1] + dy)
+                if neighbor not in combined_free and neighbor not in self.wall_cells:
+                    unknown_count += 1
+            if unknown_count > 0:
+                exploration_cells[c] = unknown_count
+
+        # Pre-compute region richness for frontier cells:
+        # Count unsearched free cells in a 3-cell radius (6m).
+        # Frontiers near big white (unsearched) areas get a strong pull bonus.
+        # This makes the drone go to the big unexplored region instead of
+        # picking off small frontier pockets near already-explored areas.
+        frontier_richness = {}
+        for c in exploration_cells:
+            count = 0
+            for rx in range(-3, 4):
+                for ry in range(-3, 4):
+                    nc = (c[0] + rx, c[1] + ry)
+                    if nc in combined_free and nc not in searched_set:
+                        count += 1
+            frontier_richness[c] = count
+
+        def cell_score(c):
+            # Base: BFS distance through free space (not Manhattan!)
+            # BFS distance respects walls — a cell 3 steps through a doorway
+            # scores better than a cell 2 steps with a wall in the way.
+            if use_bfs:
+                dist = float(bfs_distances.get(c, 999))
+            else:
+                dist = float(abs(c[0] - curr_cell[0]) + abs(c[1] - curr_cell[1]))
+
+            # EXPLORATION BONUS: Strong preference for frontier cells
+            # More unknown neighbors = stronger bonus (doorways to new rooms)
+            if c in exploration_cells:
+                unknown_count = exploration_cells[c]
+                # Base frontier bonus: -8 (was -5)
+                # Extra bonus for cells surrounded by unknown: up to -12
+                dist -= 8 + unknown_count
+                # "Doorway" detection: frontier cell with free cells visible
+                # through it (has both free and unknown neighbors) gets extra bonus
+                has_free_neighbor = False
+                for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    neighbor = (c[0] + dx, c[1] + dy)
+                    if neighbor in combined_free and neighbor not in self.wall_cells:
+                        has_free_neighbor = True
+                        break
+                if has_free_neighbor and unknown_count >= 1:
+                    dist -= 5  # Doorway bonus — aggressively targets room entrances
+
+                # REGION RICHNESS: prefer frontiers near large unsearched areas.
+                # A frontier next to 30 unsearched cells (big white space) is worth
+                # traveling far for.  A frontier next to 3 unsearched cells (small
+                # pocket near explored area) is not.
+                richness = frontier_richness.get(c, 0)
+                if richness > 3:
+                    dist -= min(richness * 0.6, 18)  # Up to -18 for rich regions
+
+            # WALL PENALTY: Slight penalty for wall_cells (may get stuck)
+            if c in self.wall_cells:
+                dist += 2
+
+            # Multi-drone: strong penalty for claimed cells
             if c in self.claimed_by_others:
-                dist += 5  # Small penalty, not +1000 blocking
-            
-            # V11.6: SWEEP PREFERENCE - prefer cells that continue current direction
-            # This creates more efficient lawnmower-like coverage patterns
+                dist += 15
+
+            # Multi-drone: prefer cells FAR from other drones (spatial separation)
+            # Only penalize if NO wall between us and the other drone (line-of-sight)
+            if self.other_drone_positions and self._last_position:
+                wx = c[0] * self.grid_size + self.grid_size / 2
+                wy = c[1] * self.grid_size + self.grid_size / 2
+                for op in self.other_drone_positions:
+                    d = math.hypot(wx - op[0], wy - op[1])
+                    if d < 15.0:
+                        # Skip penalty if a wall separates us from the other drone
+                        if self._has_wall_between(
+                                self._last_position[0], self._last_position[1],
+                                op[0], op[1]):
+                            continue
+                        dist += (15.0 - d) * 1.3  # Up to +20 penalty at 0m
+
+            # Sweep preference — continue current direction
             if self.last_sweep_direction and len(self.last_searched_cells) >= 2:
-                dx = c[0] - curr_cell[0]
-                dy = c[1] - curr_cell[1]
-                # If moving in same direction as last move, give bonus
-                if (dx != 0 or dy != 0):
-                    # Normalize direction
-                    norm_dx = 1 if dx > 0 else (-1 if dx < 0 else 0)
-                    norm_dy = 1 if dy > 0 else (-1 if dy < 0 else 0)
+                cdx = c[0] - curr_cell[0]
+                cdy = c[1] - curr_cell[1]
+                if cdx != 0 or cdy != 0:
+                    norm_dx = 1 if cdx > 0 else (-1 if cdx < 0 else 0)
+                    norm_dy = 1 if cdy > 0 else (-1 if cdy < 0 else 0)
                     if (norm_dx, norm_dy) == self.last_sweep_direction:
-                        dist -= 1.5  # Bonus for continuing sweep direction
-            
-            # V11.6: REGION COMPLETION - prefer cells adjacent to recently searched
-            # This ensures we complete rooms before moving to new areas
-            for recent in self.last_searched_cells[-5:]:  # Check last 5 searched
+                        dist -= 1.5
+
+            # Region completion — prefer cells adjacent to recently searched
+            for recent in self.last_searched_cells[-5:]:
                 if abs(c[0] - recent[0]) <= 1 and abs(c[1] - recent[1]) <= 1:
-                    dist -= 1.0  # Strong bonus for completing regions
-                    break  # Only apply once
-            
-            # RUSH MODE: stronger bonus for cells with unsearched neighbors
-            # V11.6: Increased from 0.3 to 0.5 per neighbor
+                    dist -= 1.0
+                    break
+
+            # Rush mode: prefer clusters of unsearched cells
             if rush_mode:
                 unsearched_neighbors = self._count_unsearched_neighbors(c)
                 dist -= unsearched_neighbors * 0.5
-            
-            # NO position-based repulsion! This was causing the "spring" oscillation.
-            # Drones spread naturally because:
-            # 1. global_searched prevents going where others have already been
-            # 2. claimed cells get small penalty
-            # 3. Sweep preference keeps them moving efficiently
-            
+
             return dist
-        
-        # Sort by score (distance + spatial repulsion)
-        all_frontiers.sort(key=frontier_score)
-        
-        # Pick the best one (nearest unsearched, with sweep and region preferences)
-        # Target persistence above ensures we stick with chosen target
-        best = all_frontiers[0]
-        
-        # Track this target (for debugging, not for switching)
+
+        # Frontiers found — reset no-frontier flag
+        self._no_frontier_logged = False
+        self._needs_rotation_scan = False
+
+        candidates.sort(key=cell_score)
+        best = candidates[0]
+
+        # Track target for debugging
         self.recent_targets.append(best)
         if len(self.recent_targets) > self.max_recent_targets:
             self.recent_targets = self.recent_targets[-self.max_recent_targets:]
-        
-        # V11.6: Update sweep direction for next iteration
+
+        # Update sweep direction
         dx = best[0] - curr_cell[0]
         dy = best[1] - curr_cell[1]
         if dx != 0 or dy != 0:
             norm_dx = 1 if dx > 0 else (-1 if dx < 0 else 0)
             norm_dy = 1 if dy > 0 else (-1 if dy < 0 else 0)
             self.last_sweep_direction = (norm_dx, norm_dy)
-        
-        # Update target
+
         self.target_cell = best
-        self.target_persistence_time = now
+        self.target_persistence_time = self.simulated_elapsed
         return self._to_world(best)
 
     def _count_unsearched_neighbors(self, cell: Tuple[int, int]) -> int:
@@ -500,31 +617,75 @@ class SystematicMapper:
         return (int(x / self.grid_size), int(y / self.grid_size))
 
     def _to_world(self, cell: Tuple[int, int]) -> Tuple[float, float]:
-        """Convert grid cell to world coordinates (center of cell)."""
-        return (cell[0] * self.grid_size + self.grid_size / 2,
-                cell[1] * self.grid_size + self.grid_size / 2)
+        """Convert grid cell to world coordinates (center of cell).
+
+        If the cell is also in wall_cells (wall-adjacent), offset 30% toward
+        the nearest pure-free neighbor to avoid wall-hugging targets that
+        cause the drone to get stuck.
+        """
+        cx = cell[0] * self.grid_size + self.grid_size / 2
+        cy = cell[1] * self.grid_size + self.grid_size / 2
+
+        if cell in self.wall_cells:
+            # Find nearest pure-free neighbor (in free_cells but NOT in wall_cells)
+            best_neighbor = None
+            best_dist = float('inf')
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    neighbor = (cell[0] + dx, cell[1] + dy)
+                    if neighbor in self.free_cells and neighbor not in self.wall_cells:
+                        dist = abs(dx) + abs(dy)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_neighbor = neighbor
+
+            if best_neighbor is not None:
+                # Offset 30% toward the pure-free neighbor
+                nx = best_neighbor[0] * self.grid_size + self.grid_size / 2
+                ny = best_neighbor[1] * self.grid_size + self.grid_size / 2
+                cx = cx + 0.3 * (nx - cx)
+                cy = cy + 0.3 * (ny - cy)
+
+        return (cx, cy)
 
     def is_mission_complete(self) -> bool:
-        """Check if search is complete (considering all drones' coverage)."""
-        if len(self.free_cells) < 10:
+        """Check if search is complete (considering all drones' coverage).
+
+        CRITICAL: Must use global_free (from gossip) so a drone doesn't
+        declare complete when other drones have discovered more free cells
+        that still need searching.
+        """
+        # Combine local + global knowledge of free space
+        all_free = self.free_cells.copy()
+        if self.global_free:
+            all_free.update(self.global_free)
+
+        interior_free = [c for c in all_free if c[1] >= 0]
+        if len(interior_free) < 5:
             return False
-        
+
         # Use global_searched if available (multi-drone coordination)
         searched_set = self.global_searched if self.global_searched else self.searched_cells
-        interior_free = [c for c in self.free_cells if c[1] >= 0]
         unsearched = [c for c in interior_free if c not in searched_set]
-        
+
         return len(unsearched) == 0
 
     def get_coverage_stats(self) -> dict:
-        """Get ACCURATE coverage percentage."""
-        interior_free = len([c for c in self.free_cells if c[1] >= 0])
-        searched_interior = len([c for c in self.searched_cells if c[1] >= 0])
-        
-        if interior_free == 0:
+        """Get ACCURATE coverage percentage.
+
+        Only counts cells that are both free AND searched (intersection),
+        not cells that were marked searched but never discovered as free.
+        """
+        interior_free = set(c for c in self.free_cells if c[1] >= 0)
+        # Only count searched cells that are actually known free cells
+        searched_interior = len(interior_free & self.searched_cells)
+
+        if len(interior_free) == 0:
             return {'coverage_pct': 0}
-        
-        pct = int(100 * searched_interior / interior_free)
+
+        pct = int(100 * searched_interior / len(interior_free))
         return {'coverage_pct': min(pct, 100)}
 
     def get_debug_info(self) -> dict:
@@ -539,7 +700,7 @@ class SystematicMapper:
         # Time remaining (use simulated time)
         time_remaining = max(0, 420 - self.simulated_elapsed)
         
-        # Distance to exit for display (V11.6a: use exit_point for accurate return distance)
+        # Distance to exit for display
         dist_to_entry = 0
         if self._last_position:
             px, py = self._last_position
@@ -555,6 +716,11 @@ class SystematicMapper:
             'time_remaining': int(time_remaining),
             'elapsed': int(self.simulated_elapsed),
             'dist_to_entry': int(dist_to_entry),
+            # Mapping stats for understanding exploration progress
+            'free_cells': len(interior_free),
+            'wall_cells': len(self.wall_cells),
+            'searched_cells': len(searched_interior),
+            'failed_targets': len(self.failed_targets),
         }
 
     def get_grid_data(self) -> dict:
@@ -608,8 +774,7 @@ class SystematicMapper:
         self._last_position = None
         self._mode = "SEARCH"
         self.entry_point = None
-        self.exit_point = None  # V11.6a: Reset exit point
-        # V11.6: Reset sweep tracking
+        self.exit_point = None
         self.last_sweep_direction = None
         self.last_searched_cells.clear()
-        print(f"SYSTEMATIC_MAPPER V11.6a: Drone {self.drone_id} reset")
+        print(f"SYSTEMATIC_MAPPER V11.8: Drone {self.drone_id} reset")

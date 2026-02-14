@@ -273,7 +273,7 @@ class GraphicsEngine:
             if end_pos:
                 pygame.draw.circle(self.screen, ray_color, end_pos, 2)
     
-    def draw_ui(self, drone, slam_system, comm_system, mission_start_time=None, search_method: Optional[str] = None, search_options: Optional[List[str]] = None, search_debug: Optional[Dict] = None):
+    def draw_ui(self, drone, slam_system, comm_system, mission_start_time=None, search_method: Optional[str] = None, search_options: Optional[List[str]] = None, search_debug: Optional[Dict] = None, multi_drone_data: Optional[Dict] = None):
         """Draw user interface elements."""
         # Draw background panel (narrower: 250px instead of 300px)
         ui_rect = pygame.Rect(self.window_size[0] - 250, 0, 250, self.window_size[1])
@@ -308,24 +308,85 @@ class GraphicsEngine:
         self.screen.blit(speed_surface, (ui_rect.x + 120, y_offset))
         y_offset += line_height
         
-        # Battery and Timer on same row
-        battery_text = f"Battery: {status['battery']:.1f}%"
-        # Color thresholds for quick glance
-        battery_color = Colors.GREEN if status['battery'] > 50 else Colors.ORANGE if status['battery'] > 20 else Colors.RED
-        battery_surface = self.font_small.render(battery_text, True, battery_color)
-        self.screen.blit(battery_surface, (ui_rect.x + 10, y_offset))
-        
-        # Mission timer next to battery
-        if mission_start_time is not None:
-            # mission_start_time is now the simulated elapsed time in seconds
-            elapsed = mission_start_time
-            minutes = int(elapsed // 60)
-            seconds = int(elapsed % 60)
-            timer_text = f"Time: {minutes:02d}:{seconds:02d}"
-            timer_surface = self.font_small.render(timer_text, True, Colors.GREEN)
-            self.screen.blit(timer_surface, (ui_rect.x + 150, y_offset))  # Next to battery
-        
-        y_offset += line_height
+        # Battery and Timer — per-drone grid or single drone
+        if multi_drone_data and multi_drone_data.get('drones'):
+            drones_info = multi_drone_data['drones']
+            col_w = 57
+            row_h = 26
+            grid_x = ui_rect.x + 5
+
+            for idx, di in enumerate(drones_info[:12]):
+                col = idx % 4
+                row = idx // 4
+                cx = grid_x + col * col_w
+                cy = y_offset + row * row_h
+
+                color = di.get('color', Colors.GRAY)
+                elapsed_s = di.get('elapsed', 0)
+                battery = di.get('battery', 100)
+                did = di.get('id', idx)
+
+                # Timer: "D0 1:45"
+                mins = int(elapsed_s // 60)
+                secs = int(elapsed_s % 60)
+                timer_str = f"D{did} {mins}:{secs:02d}"
+                timer_surf = self.font_small.render(timer_str, True, color)
+                self.screen.blit(timer_surf, (cx, cy))
+
+                # Battery bar (thin, color-coded)
+                bar_y = cy + 14
+                bar_w = col_w - 6
+                bar_h = 4
+                pygame.draw.rect(self.screen, (200, 200, 200), (cx, bar_y, bar_w, bar_h))
+                fill_w = int(bar_w * battery / 100)
+                bar_color = (0, 200, 0) if battery > 50 else (255, 165, 0) if battery > 20 else (255, 0, 0)
+                pygame.draw.rect(self.screen, bar_color, (cx, bar_y, fill_w, bar_h))
+
+            num_rows = min(3, (len(drones_info) + 3) // 4)
+            y_offset += num_rows * row_h + 4
+
+            # Mesh links and global coverage
+            mesh_links = multi_drone_data.get('mesh_links', 0)
+            global_cov = multi_drone_data.get('global_coverage', 0)
+            comm_range = multi_drone_data.get('comm_range', 0)
+            mesh_color = (0, 180, 0) if mesh_links > 0 else (200, 0, 0)
+            mesh_surf = self.font_small.render(f"Mesh: {mesh_links} links  Cov: {global_cov}%", True, mesh_color)
+            self.screen.blit(mesh_surf, (ui_rect.x + 10, y_offset))
+            y_offset += 18
+
+            # Per-drone status line: "D0:SRCH 45% OK" compact
+            for di in drones_info[:12]:
+                did = di.get('id', 0)
+                color = di.get('color', Colors.GRAY)
+                st = di.get('status', '?')
+                cov = di.get('coverage_pct', 0)
+                sync_ok = di.get('sync_ok', False)
+                merged = di.get('merged_cells', 0)
+                sync_str = "OK" if sync_ok else "--"
+                sync_color = (0, 180, 0) if sync_ok else (150, 150, 150)
+                line = f"D{did}:{st} {cov}%"
+                self.screen.blit(self.font_small.render(line, True, color), (ui_rect.x + 10, y_offset))
+                # Sync + merge count on right
+                info_str = f"+{merged} {sync_str}"
+                self.screen.blit(self.font_small.render(info_str, True, sync_color), (ui_rect.x + 130, y_offset))
+                y_offset += 15
+
+            y_offset += 5
+        else:
+            battery_text = f"Battery: {status['battery']:.1f}%"
+            battery_color = Colors.GREEN if status['battery'] > 50 else Colors.ORANGE if status['battery'] > 20 else Colors.RED
+            battery_surface = self.font_small.render(battery_text, True, battery_color)
+            self.screen.blit(battery_surface, (ui_rect.x + 10, y_offset))
+
+            if mission_start_time is not None:
+                elapsed = mission_start_time
+                minutes = int(elapsed // 60)
+                seconds = int(elapsed % 60)
+                timer_text = f"Time: {minutes:02d}:{seconds:02d}"
+                timer_surface = self.font_small.render(timer_text, True, Colors.GREEN)
+                self.screen.blit(timer_surface, (ui_rect.x + 150, y_offset))
+
+            y_offset += line_height
         
         # Mission status - use search debug info if available
         if search_debug:
@@ -353,9 +414,30 @@ class GraphicsEngine:
             y_offset += line_height
             
             # Distance to entry (important for return)
-            dist_text = f"Dist to entry: {dist_home}m"
+            dist_text = f"Dist to exit: {dist_home}m"
             dist_surface = self.font_small.render(dist_text, True, Colors.BLACK)
             self.screen.blit(dist_surface, (ui_rect.x + 10, y_offset))
+            y_offset += line_height
+
+            # Mapping stats — concise overview of exploration progress
+            free_n = search_debug.get('free_cells', 0)
+            wall_n = search_debug.get('wall_cells', 0)
+            searched_n = search_debug.get('searched_cells', 0)
+            failed_n = search_debug.get('failed_targets', 0)
+            map_text = f"Map: {free_n} free, {wall_n} wall, {searched_n} searched"
+            map_surface = self.font_small.render(map_text, True, Colors.DARK_GRAY)
+            self.screen.blit(map_surface, (ui_rect.x + 10, y_offset))
+            y_offset += 18
+            if failed_n > 0:
+                fail_text = f"Failed targets: {failed_n}"
+                fail_surface = self.font_small.render(fail_text, True, Colors.ORANGE)
+                self.screen.blit(fail_surface, (ui_rect.x + 10, y_offset))
+                y_offset += 18
+
+            # Sensor spec reminder
+            lidar_text = "LiDAR: 59°/9m | IED: 2m | Grid: 2m"
+            lidar_surface = self.font_small.render(lidar_text, True, Colors.DARK_GRAY)
+            self.screen.blit(lidar_surface, (ui_rect.x + 10, y_offset))
             y_offset += line_height
         else:
             mission_text = f"Mission: {'Complete' if status['mission_complete'] else 'Active'}"
@@ -400,9 +482,11 @@ class GraphicsEngine:
         
         controls = [
             "SPACE: Start/Stop Mission",
-            "R: Reset Simulation", 
+            "R: Reset Simulation",
+            "D: Add/Cycle Drones",
             "N: New Object Placement",
             "B: New Building Layout",
+            "+/-: Comm Range",
             "P: Save Screenshot",
             "ESC: Exit"
         ]
@@ -424,430 +508,331 @@ class GraphicsEngine:
                 self.screen.blit(self.font_small.render(line, True, color), (ui_rect.x + 10, y_offset))
                 y_offset += line_height
 
-    def draw_minimap(self, minimap_data: Dict, drone_pos: Tuple[float, float]):
+    def _draw_map_panel(self, panel_x, panel_y, panel_width, panel_height,
+                        title, border_color, world_bounds, grid_size,
+                        searched_cells=None, frontier_cells=None,
+                        wall_segments=None, drone_positions=None,
+                        features=None, breadcrumbs=None, doors=None):
+        """Unified map panel renderer used by both draw_minimap and draw_drone_maps.
+
+        Args:
+            panel_x, panel_y: top-left corner of the panel
+            panel_width, panel_height: size of the panel
+            title: title string drawn above the panel
+            border_color: color for the panel border
+            world_bounds: (min_x, min_y, max_x, max_y) world coordinate range
+            grid_size: grid cell size in world units
+            searched_cells: list of ((wx,wy), fill_color, border_color) tuples
+            frontier_cells: dict of drone_id -> list of (wx,wy) world positions
+            wall_segments: list of ((x1,y1), (x2,y2)) line segments
+            drone_positions: list of ((x,y), color) tuples
+            features: list of dicts with 'type', 'position' (world), 'label'
+            breadcrumbs: list of (x,y) world positions
+            doors: list of (x,y) world positions
         """
-        Draw the minimap showing discovered features.
-        
-        === POSITIONING CONTROLS ===
-        minimap_x, minimap_y: Top-left corner of minimap frame
-        minimap_width, minimap_height: Size of the minimap frame
-        
-        === MAPPING CONTROLS ===
-        world_bounds: The world coordinates to map (min_x, min_y, max_x, max_y)
-        - Decrease min_y to shift map content UP (e.g., -10 instead of -5)
-        - Increase min_y to shift map content DOWN
-        - Decrease min_x to shift map content RIGHT
-        - Increase min_x to shift map content LEFT
-        
-        padding_x, padding_top, padding_bottom: Space between frame and mapped content
-        - Increase to shrink the mapped area within the frame
-        - Decrease to use more of the frame for mapping
-        """
-        # Position discovered map below the main building view (not at bottom)
-        # Building view is roughly 500px tall starting at y=50
-        minimap_width = 350   
-        minimap_height = 280  
-        minimap_x = 50        
-        minimap_y = 580  # Below main map (50 + ~500 + 30 margin)
-        
-        # Minimap data debug removed - was not useful for improving search
-        
-        # Always draw minimap background and border
-        minimap_rect = pygame.Rect(minimap_x, minimap_y, minimap_width, minimap_height)
-        pygame.draw.rect(self.screen, Colors.WHITE, minimap_rect)  # White background
-        pygame.draw.rect(self.screen, Colors.BLACK, minimap_rect, 2)  # Black border
-        
-        # Draw title
-        title_surface = self.font_small.render("Discovered Map", True, Colors.BLACK)
-        self.screen.blit(title_surface, (minimap_x, minimap_y - 15))
-        
-        
-        if not minimap_data:
-            # Show "Learning..." text
-            learning_surface = self.font_small.render("Learning...", True, Colors.DARK_GRAY)
-            text_rect = learning_surface.get_rect(center=(minimap_x + minimap_width//2, minimap_y + minimap_height//2))
-            self.screen.blit(learning_surface, text_rect)
-            return
-        
-        # SIMPLE - just use the data as-is and show everything
-        world_bounds = minimap_data.get("world_bounds", (-5, -5, 55, 45))
+        # Background and border
+        rect = pygame.Rect(panel_x, panel_y, panel_width, panel_height)
+        pygame.draw.rect(self.screen, Colors.WHITE, rect)
+        pygame.draw.rect(self.screen, border_color, rect, 2)
+
+        # Title above panel
+        title_surf = self.font_small.render(title, True, border_color)
+        self.screen.blit(title_surf, (panel_x + 2, panel_y - 14))
+
+        # Coordinate transform setup
         min_x, min_y, max_x, max_y = world_bounds
-        
-        # Extend view slightly to ensure edges aren't clipped
-        margin = 5
-        min_x -= margin
-        max_x += margin
-        min_y -= margin
-        max_y += margin
-        
-        def world_to_minimap(world_pos):
-            """Simple direct mapping from world to screen."""
-            wx, wy = world_pos
-            
-            # Simple padding
-            pad = 15
-            
-            # Direct linear mapping
+        pad = 15
+
+        def world_to_panel(wx, wy):
             x_ratio = (wx - min_x) / (max_x - min_x) if max_x != min_x else 0.5
             y_ratio = (wy - min_y) / (max_y - min_y) if max_y != min_y else 0.5
-            
-            # Map to screen
-            map_x = minimap_x + pad + int(x_ratio * (minimap_width - 2*pad))
-            map_y = minimap_y + pad + int(y_ratio * (minimap_height - 2*pad))
-            return (map_x, map_y)
-        
-        # Draw 3x3 SEARCHED GRID cells (colored squares showing IED-scanned areas)
-        grid_size = minimap_data.get("grid_size", 3.0)
-        
-        # Check for multi-drone colored cells first
+            px = panel_x + pad + int(x_ratio * (panel_width - 2 * pad))
+            py = panel_y + pad + int(y_ratio * (panel_height - 2 * pad))
+            return (px, py)
+
+        def in_bounds(px, py):
+            return (panel_x + pad < px < panel_x + panel_width - pad and
+                    panel_y + pad < py < panel_y + panel_height - pad)
+
+        # Cell pixel size
+        scale_factor = min((panel_width - 2*pad) / (max_x - min_x),
+                           (panel_height - 2*pad) / (max_y - min_y)) if max_x > min_x and max_y > min_y else 1
+        cell_px = max(4, int(grid_size * scale_factor))
+
+        # 1. Searched cells (colored rects with border)
+        if searched_cells:
+            cs = max(2, cell_px // 2)
+            for cell_entry in searched_cells:
+                wx, wy = cell_entry[0]
+                fill = cell_entry[1]
+                bdr = cell_entry[2]
+                tl = world_to_panel(wx - grid_size / 2, wy - grid_size / 2)
+                br = world_to_panel(wx + grid_size / 2, wy + grid_size / 2)
+                w = max(br[0] - tl[0], 4)
+                h = max(br[1] - tl[1], 4)
+                r = pygame.Rect(tl[0], tl[1], w, h)
+                pygame.draw.rect(self.screen, fill, r)
+                pygame.draw.rect(self.screen, bdr, r, 1)
+
+        # 2. Wall segments (black lines)
+        if wall_segments:
+            for ws, we in wall_segments:
+                sp = world_to_panel(ws[0], ws[1])
+                ep = world_to_panel(we[0], we[1])
+                if (panel_x <= sp[0] <= panel_x + panel_width or
+                        panel_x <= ep[0] <= panel_x + panel_width):
+                    pygame.draw.line(self.screen, Colors.BLACK, sp, ep, 2)
+
+        # 3. Frontier cells (yellow, small shapes — 1/3 original size)
+        if frontier_cells:
+            for drone_id, cells in frontier_cells.items():
+                for wx, wy in cells:
+                    pos = world_to_panel(wx, wy)
+                    if not in_bounds(pos[0], pos[1]):
+                        continue
+                    x, y = pos
+                    if drone_id == 0:
+                        pygame.draw.circle(self.screen, (255, 200, 0), pos, 2)
+                    elif drone_id == 1:
+                        pts = [(x, y - 2), (x - 1, y + 1), (x + 1, y + 1)]
+                        pygame.draw.polygon(self.screen, (255, 200, 0), pts)
+                    elif drone_id == 2:
+                        pygame.draw.rect(self.screen, (255, 200, 0), (x - 1, y - 1, 2, 2))
+                    else:
+                        pts = [(x, y - 2), (x + 2, y), (x, y + 2), (x - 2, y)]
+                        pygame.draw.polygon(self.screen, (255, 200, 0), pts)
+
+        # 4. Doors (green squares)
+        if doors:
+            for dx, dy in doors:
+                dp = world_to_panel(dx, dy)
+                pygame.draw.rect(self.screen, Colors.GREEN, (dp[0] - 2, dp[1] - 2, 4, 4))
+
+        # 5. Features (IEDs red + label, objects blue + label)
+        if features:
+            for f in features:
+                fpos = world_to_panel(f['position'][0], f['position'][1])
+                if not (panel_x < fpos[0] < panel_x + panel_width and
+                        panel_y < fpos[1] < panel_y + panel_height):
+                    continue
+                if f['type'] == 'ied':
+                    pygame.draw.circle(self.screen, Colors.RED, fpos, 4)
+                    pygame.draw.circle(self.screen, Colors.WHITE, fpos, 4, 1)
+                    lbl = self.font_small.render("IED!", True, Colors.RED)
+                    self.screen.blit(lbl, (fpos[0] + 5, fpos[1] - 6))
+                else:
+                    pygame.draw.circle(self.screen, Colors.BLUE, fpos, 3)
+                    label = f.get('label', '')
+                    if label:
+                        lbl = self.font_small.render(label[:6], True, Colors.BLUE)
+                        self.screen.blit(lbl, (fpos[0] + 4, fpos[1] - 6))
+
+        # 6. Breadcrumbs (light green dots)
+        if breadcrumbs:
+            for i in range(0, len(breadcrumbs), 3):
+                if i < len(breadcrumbs):
+                    cp = world_to_panel(breadcrumbs[i][0], breadcrumbs[i][1])
+                    pygame.draw.circle(self.screen, (150, 255, 150), cp, 1)
+
+        # 7. Drone positions (colored circle with white border)
+        if drone_positions:
+            for pos, clr in drone_positions:
+                dp = world_to_panel(pos[0], pos[1])
+                pygame.draw.circle(self.screen, clr, dp, 5)
+                pygame.draw.circle(self.screen, Colors.WHITE, dp, 5, 1)
+
+    def draw_minimap(self, minimap_data: Dict, drone_pos: Tuple[float, float]):
+        """Draw the Discovered Map using the unified _draw_map_panel."""
+        minimap_width = 350
+        minimap_height = 280
+        minimap_x = 50
+        minimap_y = 580
+
+        if not minimap_data:
+            # Draw empty panel with "Learning..." text
+            rect = pygame.Rect(minimap_x, minimap_y, minimap_width, minimap_height)
+            pygame.draw.rect(self.screen, Colors.WHITE, rect)
+            pygame.draw.rect(self.screen, Colors.BLACK, rect, 2)
+            title_surface = self.font_small.render("Discovered Map", True, Colors.BLACK)
+            self.screen.blit(title_surface, (minimap_x, minimap_y - 15))
+            learning_surface = self.font_small.render("Learning...", True, Colors.DARK_GRAY)
+            text_rect = learning_surface.get_rect(center=(minimap_x + minimap_width // 2, minimap_y + minimap_height // 2))
+            self.screen.blit(learning_surface, text_rect)
+            return
+
+        # Build world bounds with margin
+        wb = minimap_data.get("world_bounds", (-5, -5, 55, 45))
+        margin = 5
+        world_bounds = (wb[0] - margin, wb[1] - margin, wb[2] + margin, wb[3] + margin)
+
+        grid_size = minimap_data.get("grid_size", 2.0)
+
+        # --- Convert searched cells to unified format ---
+        searched_cells = []
         searched_cells_colored = minimap_data.get("searched_cells_colored", [])
         if searched_cells_colored:
-            # Multi-drone mode: draw each cell in drone's color (lighter shade)
             for cell_data in searched_cells_colored:
                 if isinstance(cell_data, tuple) and len(cell_data) == 2:
                     (wx, wy), color = cell_data
-                    # Make a lighter shade of the drone's color
-                    light_color = (
-                        min(255, color[0] + 100),
-                        min(255, color[1] + 100),
-                        min(255, color[2] + 100)
-                    )
-                    border_color = color
+                    fill = (min(255, color[0] + 100), min(255, color[1] + 100), min(255, color[2] + 100))
+                    searched_cells.append(((wx, wy), fill, color))
                 else:
                     wx, wy = cell_data
-                    light_color = (200, 255, 200)
-                    border_color = (100, 200, 100)
-                
-                top_left = world_to_minimap((wx - grid_size/2, wy - grid_size/2))
-                bot_right = world_to_minimap((wx + grid_size/2, wy + grid_size/2))
-                w = max(bot_right[0] - top_left[0], 4)
-                h = max(bot_right[1] - top_left[1], 4)
-                rect = pygame.Rect(top_left[0], top_left[1], w, h)
-                pygame.draw.rect(self.screen, light_color, rect)
-                pygame.draw.rect(self.screen, border_color, rect, 1)
+                    searched_cells.append(((wx, wy), (200, 255, 200), (100, 200, 100)))
         else:
-            # Single drone mode: all cells light green
-            searched_cells = minimap_data.get("searched_cells", [])
-            for wx, wy in searched_cells:
-                top_left = world_to_minimap((wx - grid_size/2, wy - grid_size/2))
-                bot_right = world_to_minimap((wx + grid_size/2, wy + grid_size/2))
-                w = max(bot_right[0] - top_left[0], 4)
-                h = max(bot_right[1] - top_left[1], 4)
-                rect = pygame.Rect(top_left[0], top_left[1], w, h)
-                pygame.draw.rect(self.screen, (200, 255, 200), rect)  # Light green fill
-                pygame.draw.rect(self.screen, (100, 200, 100), rect, 1)  # Green border
-        
-        # Draw FRONTIER cells with different shapes per drone
+            for wx, wy in minimap_data.get("searched_cells", []):
+                searched_cells.append(((wx, wy), (200, 255, 200), (100, 200, 100)))
+
+        # --- Convert frontiers to unified format ---
         frontiers_by_drone = minimap_data.get("frontiers_by_drone", {})
-        if frontiers_by_drone:
-            # Multi-drone: different shapes per drone
-            # Drone 0: circles, Drone 1: triangles, Drone 2: squares, Drone 3: diamonds
-            for drone_id, frontiers in frontiers_by_drone.items():
-                for wx, wy in frontiers:
-                    map_pos = world_to_minimap((wx, wy))
-                    x, y = map_pos
-                    if drone_id == 0:
-                        # Circles for drone 0
-                        pygame.draw.circle(self.screen, (255, 200, 0), map_pos, 4)
-                    elif drone_id == 1:
-                        # Triangles for drone 1
-                        points = [(x, y-5), (x-4, y+3), (x+4, y+3)]
-                        pygame.draw.polygon(self.screen, (255, 200, 0), points)
-                    elif drone_id == 2:
-                        # Squares for drone 2
-                        pygame.draw.rect(self.screen, (255, 200, 0), (x-3, y-3, 6, 6))
-                    else:
-                        # Diamonds for drone 3+
-                        points = [(x, y-4), (x+4, y), (x, y+4), (x-4, y)]
-                        pygame.draw.polygon(self.screen, (255, 200, 0), points)
-        else:
-            # Single drone: all circles
-            frontier_cells = minimap_data.get("frontier_cells", [])
-            for wx, wy in frontier_cells:
-                map_pos = world_to_minimap((wx, wy))
-                pygame.draw.circle(self.screen, (255, 200, 0), map_pos, 4)  # Yellow dot
-        
-        # Draw wall segments (black lines) - on top of grid
-        wall_segments = minimap_data.get("wall_segments", [])
-        for wall_start, wall_end in wall_segments:
-            start_pos = world_to_minimap(wall_start)
-            end_pos = world_to_minimap(wall_end)
-            pygame.draw.line(self.screen, Colors.BLACK, start_pos, end_pos, 2)
-        
-        # Draw discovered doors (green squares)
-        doors = minimap_data.get("doors", [])
-        for door_pos in doors:
-            map_pos = world_to_minimap(door_pos)
-            pygame.draw.rect(self.screen, Colors.GREEN, (map_pos[0]-2, map_pos[1]-2, 4, 4))
-        
-        # Draw discovered objects with LABELS (blue circles)
-        objects = minimap_data.get("objects", [])
-        for obj_data in objects:
+        if not frontiers_by_drone:
+            frontier_list = minimap_data.get("frontier_cells", [])
+            if frontier_list:
+                frontiers_by_drone = {0: frontier_list}
+
+        # --- Features ---
+        features = []
+        for obj_data in minimap_data.get("objects", []):
             if isinstance(obj_data, tuple) and len(obj_data) >= 2:
-                obj_pos = obj_data[0]
-                # Check if there's label info
                 label = obj_data[2] if len(obj_data) > 2 else ""
-            else:
-                continue
-            map_pos = world_to_minimap(obj_pos)
-            pygame.draw.circle(self.screen, Colors.BLUE, map_pos, 3)
-            # Draw label if available
-            if label:
-                lbl = self.font_small.render(label[:6], True, Colors.BLUE)
-                self.screen.blit(lbl, (map_pos[0]+4, map_pos[1]-6))
-        
-        # Draw discovered IEDs with LABELS (red circles with warning)
-        ieds = minimap_data.get("ieds", [])
-        for ied_data in ieds:
+                features.append({'type': 'object', 'position': obj_data[0], 'label': label})
+        for ied_data in minimap_data.get("ieds", []):
             if isinstance(ied_data, tuple) and len(ied_data) >= 2:
-                ied_pos = ied_data[0]
-            else:
-                continue
-            map_pos = world_to_minimap(ied_pos)
-            pygame.draw.circle(self.screen, Colors.RED, map_pos, 4)
-            pygame.draw.circle(self.screen, Colors.WHITE, map_pos, 4, 1)
-            # Always label IEDs
-            lbl = self.font_small.render("IED!", True, Colors.RED)
-            self.screen.blit(lbl, (map_pos[0]+5, map_pos[1]-6))
-        
-        # Draw breadcrumb trail (light green dots showing where drone has been)
-        breadcrumbs = minimap_data.get("breadcrumbs", [])
-        if breadcrumbs:
-            # Sample breadcrumbs to avoid too many dots
-            for i in range(0, len(breadcrumbs), 3):  # Every 3rd breadcrumb
-                if i < len(breadcrumbs):
-                    crumb_pos = world_to_minimap(breadcrumbs[i])
-                    pygame.draw.circle(self.screen, (150, 255, 150), crumb_pos, 1)  # Light green dots
-        
-        # Draw drone position(s) using same coordinate system
-        drone_positions = minimap_data.get("drone_positions", None)
-        if drone_positions:
-            # Multi-drone: draw all drones with their colors
-            for pos, color in drone_positions:
-                dm_pos = world_to_minimap(pos)
-                pygame.draw.circle(self.screen, color, dm_pos, 5)
-                pygame.draw.circle(self.screen, Colors.WHITE, dm_pos, 5, 1)
+                features.append({'type': 'ied', 'position': ied_data[0], 'label': 'IED!'})
+
+        # --- Drone positions ---
+        dp_list = minimap_data.get("drone_positions", None)
+        if dp_list:
+            drone_positions = dp_list
         else:
-            # Single drone: red dot
-            drone_minimap_pos = world_to_minimap(drone_pos)
-            pygame.draw.circle(self.screen, Colors.RED, drone_minimap_pos, 5)
-            pygame.draw.circle(self.screen, Colors.WHITE, drone_minimap_pos, 5, 1)
-        
-        
-    
+            drone_positions = [(drone_pos, Colors.RED)]
+
+        self._draw_map_panel(
+            minimap_x, minimap_y, minimap_width, minimap_height,
+            "Discovered Map", Colors.BLACK, world_bounds, grid_size,
+            searched_cells=searched_cells,
+            frontier_cells=frontiers_by_drone,
+            wall_segments=minimap_data.get("wall_segments", []),
+            drone_positions=drone_positions,
+            features=features,
+            breadcrumbs=minimap_data.get("breadcrumbs", []),
+            doors=minimap_data.get("doors", []),
+        )
+
     def draw_drone_maps(self, drone_maps_data: List[dict], world_bounds: Tuple[float, float, float, float], wall_segments: List = None):
-        """Draw individual maps for each drone showing their local knowledge.
-        
-        Args:
-            drone_maps_data: List of dicts, one per drone, containing:
-                - 'free_cells': set of (x,y) grid cells
-                - 'searched_cells': set of (x,y) grid cells  
-                - 'wall_cells': set of (x,y) grid cells
-                - 'searched_by_drone': dict of drone_id -> set of cells (for color-coded display)
-                - 'color': drone color
-                - 'drone_id': drone index
-                - 'position': current position
-            world_bounds: (min_x, min_y, max_x, max_y) for coordinate mapping
-            wall_segments: List of wall segments from environment for building outline
-        """
+        """Draw individual maps for each drone using the unified _draw_map_panel."""
         if not drone_maps_data:
             return
-        
+
         if wall_segments is None:
             wall_segments = []
-        
-        # Vertical column between main map and status panel
-        # Same scale as Discovered Map (350x280) for uniform appearance
+
         map_width = 350
         map_height = 280
-        start_x = self.window_size[0] - 250 - map_width - 10  # Left of status panel
-        start_y = 35  # Reset to original position
-        map_spacing = 35  # More space between maps
-        
-        min_x, min_y, max_x, max_y = world_bounds
-        grid_size = 3.0
-        
-        for idx, drone_data in enumerate(drone_maps_data):
-            # Position for this drone's map (vertical stack with more spacing)
+        start_x = self.window_size[0] - 250 - map_width - 10
+        start_y = 35
+        map_spacing = 35
+
+        # Add margin to world bounds (same as minimap)
+        margin = 5
+        wb = (world_bounds[0] - margin, world_bounds[1] - margin,
+              world_bounds[2] + margin, world_bounds[3] + margin)
+        min_x, min_y, max_x, max_y = wb
+
+        grid_size = 2.0
+
+        # Limit to 3 maps
+        display_count = min(len(drone_maps_data), 3)
+
+        for idx in range(display_count):
+            drone_data = drone_maps_data[idx]
             map_x = start_x
             map_y = start_y + idx * (map_height + map_spacing)
-            
-            # Background
-            map_rect = pygame.Rect(map_x, map_y, map_width, map_height)
-            pygame.draw.rect(self.screen, Colors.WHITE, map_rect)
-            pygame.draw.rect(self.screen, drone_data.get('color', Colors.BLACK), map_rect, 2)
-            
-            # Title with drone ID
+
             drone_id = drone_data.get('drone_id', idx)
-            title = f"D{drone_id} Map"
-            title_surf = self.font_small.render(title, True, drone_data.get('color', Colors.BLACK))
-            self.screen.blit(title_surf, (map_x + 2, map_y - 14))
-            
-            # Coordinate transforms - use RATIO-BASED mapping like Discovered Map
-            # This ensures content is properly centered and scaled within the frame
-            pad = 15  # Same padding as Discovered Map
-            
-            # Cell size in pixels (estimate for drawing)
-            scale_factor = min((map_width - 2*pad) / (max_x - min_x), 
-                              (map_height - 2*pad) / (max_y - min_y)) if max_x > min_x and max_y > min_y else 1
-            cell_px = max(4, int(grid_size * scale_factor))
-            
-            # Vertical offset to shift content UP within box (fixes content falling out of bottom)
-            content_y_offset = -25  # Reduced from -50 to keep content inside box
-            
-            def to_map(cell):
-                """Convert grid cell to screen position - ratio-based like Discovered Map"""
-                cx, cy = cell
-                # Add grid_size/2 to get cell CENTER (not corner) - fixes 1/2 grid offset bug
-                wx = cx * grid_size + grid_size / 2
-                wy = cy * grid_size + grid_size / 2
-                # Use ratio-based mapping for proper centering
-                x_ratio = (wx - min_x) / (max_x - min_x) if max_x != min_x else 0.5
-                y_ratio = (wy - min_y) / (max_y - min_y) if max_y != min_y else 0.5
-                px = map_x + pad + int(x_ratio * (map_width - 2*pad))
-                py = map_y + pad + int(y_ratio * (map_height - 2*pad)) + content_y_offset
-                return (px, py)
-            
-            def world_to_map(world_pos):
-                """Convert world position to screen position - ratio-based like Discovered Map"""
-                wx, wy = world_pos
-                x_ratio = (wx - min_x) / (max_x - min_x) if max_x != min_x else 0.5
-                y_ratio = (wy - min_y) / (max_y - min_y) if max_y != min_y else 0.5
-                px = map_x + pad + int(x_ratio * (map_width - 2*pad))
-                py = map_y + pad + int(y_ratio * (map_height - 2*pad)) + content_y_offset
-                return (px, py)
-            
-            # Use pad instead of padding for bounds checking
-            padding = pad
-            
-            # 0. BUILDING OUTLINE (BLACK lines like Discovered Map) - draws first as background
-            for wall_start, wall_end in wall_segments:
-                start_pos = world_to_map(wall_start)
-                end_pos = world_to_map(wall_end)
-                # Clip to map bounds
-                if (map_x <= start_pos[0] <= map_x + map_width or map_x <= end_pos[0] <= map_x + map_width):
-                    pygame.draw.line(self.screen, Colors.BLACK, start_pos, end_pos, 2)  # Black, thickness 2
-            
-            # Get data
             color = drone_data.get('color', (200, 200, 200))
             light_color = (min(255, color[0] + 100), min(255, color[1] + 100), min(255, color[2] + 100))
-            walls = drone_data.get('wall_cells', set())
-            searched = drone_data.get('searched_cells', set())
-            free = drone_data.get('free_cells', set())
-            features = drone_data.get('features', [])
-            # For color-coded display: which drone searched each cell
+
+            # --- Convert searched cells to unified format ---
+            searched_cells = []
             searched_by_drone = drone_data.get('searched_by_drone', {})
             drone_colors = drone_data.get('drone_colors', {})
-            
-            # Cell drawing size (half for offset, full for rect)
-            cs = max(2, cell_px // 2)
-            
-            # 1. SEARCHED CELLS FIRST - draw in color of drone that searched them
-            # RULE: Maps become IDENTICAL after communication sync, EXCEPT:
-            #       If THIS drone searched a cell, show it in THIS drone's color
-            #       (even if another drone also searched the same cell)
-            # Style: match Discovered Map with fill + border
+
             if searched_by_drone:
-                # Collect all searched cells from all drones
                 all_searched_cells = set()
                 for cells in searched_by_drone.values():
                     all_searched_cells.update(cells)
-                
-                # Get cells this drone searched (for priority coloring)
                 my_cells = searched_by_drone.get(drone_id, set())
-                
-                # Draw each cell once, with correct color
+
                 for cell in all_searched_cells:
-                    # Determine color: if THIS drone searched it, use THIS drone's color
-                    # Otherwise use the color of whoever searched it
+                    # World position of cell center
+                    wx = cell[0] * grid_size + grid_size / 2
+                    wy = cell[1] * grid_size + grid_size / 2
                     if cell in my_cells:
-                        # This drone searched it - use this drone's color
-                        cell_color = light_color
-                        border_color = color
+                        searched_cells.append(((wx, wy), light_color, color))
                     else:
-                        # Find which drone searched it and use their color
-                        cell_color = light_color  # Default
-                        border_color = color
-                        for search_drone_id, cells in searched_by_drone.items():
-                            if cell in cells:
-                                if search_drone_id in drone_colors:
-                                    search_color = drone_colors[search_drone_id]
-                                    cell_color = (min(255, search_color[0] + 100), 
-                                                  min(255, search_color[1] + 100), 
-                                                  min(255, search_color[2] + 100))
-                                    border_color = search_color
+                        cell_fill = light_color
+                        cell_bdr = color
+                        for sid, scells in searched_by_drone.items():
+                            if cell in scells and sid in drone_colors:
+                                sc = drone_colors[sid]
+                                cell_fill = (min(255, sc[0] + 100), min(255, sc[1] + 100), min(255, sc[2] + 100))
+                                cell_bdr = sc
                                 break
-                    
-                    pos = to_map(cell)
-                    if map_x + padding < pos[0] < map_x + map_width - padding and map_y + padding < pos[1] < map_y + map_height - padding:
-                        rect = pygame.Rect(pos[0]-cs, pos[1]-cs, cell_px, cell_px)
-                        pygame.draw.rect(self.screen, cell_color, rect)  # Fill
-                        pygame.draw.rect(self.screen, border_color, rect, 1)  # Border
+                        searched_cells.append(((wx, wy), cell_fill, cell_bdr))
             else:
-                # Fallback: draw all searched cells in this drone's color (old behavior)
-                for cell in searched:
-                    pos = to_map(cell)
-                    if map_x + padding < pos[0] < map_x + map_width - padding and map_y + padding < pos[1] < map_y + map_height - padding:
-                        rect = pygame.Rect(pos[0]-cs, pos[1]-cs, cell_px, cell_px)
-                        pygame.draw.rect(self.screen, light_color, rect)  # Fill
-                        pygame.draw.rect(self.screen, color, rect, 1)  # Border
-            
-            # 2. FRONTIERS (yellow shapes) - same size as Discovered Map
-            # Frontiers = free cells that haven't been searched yet (excluding wall cells)
+                for cell in drone_data.get('searched_cells', set()):
+                    wx = cell[0] * grid_size + grid_size / 2
+                    wy = cell[1] * grid_size + grid_size / 2
+                    searched_cells.append(((wx, wy), light_color, color))
+
+            # --- Convert frontiers to unified format ---
+            walls = drone_data.get('wall_cells', set())
+            searched = drone_data.get('searched_cells', set())
+            free = drone_data.get('free_cells', set())
             frontier = free - searched - walls
-            # Use fixed sizes matching Discovered Map (4 for circles, 4-5 for triangles/shapes)
+            frontier_world = []
             for cell in frontier:
-                pos = to_map(cell)
-                if map_x + padding < pos[0] < map_x + map_width - padding and map_y + padding < pos[1] < map_y + map_height - padding:
-                    x, y = pos
-                    if drone_id == 0:
-                        # Circles for drone 0 - radius 4 like Discovered Map
-                        pygame.draw.circle(self.screen, (255, 200, 0), pos, 4)
-                    elif drone_id == 1:
-                        # Triangles for drone 1 - same size as Discovered Map
-                        points = [(x, y-5), (x-4, y+3), (x+4, y+3)]
-                        pygame.draw.polygon(self.screen, (255, 200, 0), points)
-                    elif drone_id == 2:
-                        # Squares for drone 2 - 6x6 like Discovered Map
-                        pygame.draw.rect(self.screen, (255, 200, 0), (x-3, y-3, 6, 6))
-                    else:
-                        # Diamonds for drone 3+ - size 4 like Discovered Map
-                        points = [(x, y-4), (x+4, y), (x, y+4), (x-4, y)]
-                        pygame.draw.polygon(self.screen, (255, 200, 0), points)
-            
-            # NOTE: Walls are shown via building outline (BLACK lines) drawn earlier
-            # DO NOT draw wall_cells as filled black rectangles - that's the bug!
-            
-            # 3. FEATURES (IEDs red, objects blue) ON TOP - with labels like Discovered Map
-            for feature in features:
+                wx = cell[0] * grid_size + grid_size / 2
+                wy = cell[1] * grid_size + grid_size / 2
+                frontier_world.append((wx, wy))
+            frontiers_by_drone = {drone_id: frontier_world}
+
+            # --- Convert features to unified format ---
+            features = []
+            for feature in drone_data.get('features', []):
                 if hasattr(feature, 'position'):
-                    fx, fy = feature.position
-                    fcell = (int(fx / grid_size), int(fy / grid_size))
-                    fpos = to_map(fcell)
-                    if map_x < fpos[0] < map_x + map_width and map_y < fpos[1] < map_y + map_height:
-                        ftype = feature.feature_type if hasattr(feature, 'feature_type') else ''
-                        if ftype == 'ied':
-                            # Red circle with white border for IED + label
-                            pygame.draw.circle(self.screen, Colors.RED, fpos, 4)
-                            pygame.draw.circle(self.screen, Colors.WHITE, fpos, 4, 1)
-                            # Add "IED!" label like Discovered Map
-                            lbl = self.font_small.render("IED!", True, Colors.RED)
-                            self.screen.blit(lbl, (fpos[0]+5, fpos[1]-6))
-                        else:
-                            # Blue circle for other objects + label
-                            pygame.draw.circle(self.screen, Colors.BLUE, fpos, 3)
-                            # Add type label if available
-                            if ftype:
-                                lbl = self.font_small.render(ftype[:6], True, Colors.BLUE)
-                                self.screen.blit(lbl, (fpos[0]+4, fpos[1]-6))
-            
-            # 5. DRONE POSITION (on very top)
-            drone_pos = drone_data.get('position', (0, 0))
-            drone_cell = (int(drone_pos[0] / grid_size), int(drone_pos[1] / grid_size))
-            dp = to_map(drone_cell)
-            if map_x < dp[0] < map_x + map_width and map_y < dp[1] < map_y + map_height:
-                pygame.draw.circle(self.screen, color, dp, 5)
-                pygame.draw.circle(self.screen, Colors.WHITE, dp, 5, 1)
+                    ftype = feature.feature_type if hasattr(feature, 'feature_type') else ''
+                    features.append({
+                        'type': 'ied' if ftype == 'ied' else 'object',
+                        'position': feature.position,
+                        'label': ftype[:6] if ftype != 'ied' else 'IED!',
+                    })
+
+            # --- Drone position ---
+            dp = drone_data.get('position', (0, 0))
+            drone_positions = [(dp, color)]
+
+            # Title with coverage
+            cov_pct = drone_data.get('coverage_pct', None)
+            title = f"D{drone_id} Map ({cov_pct}%)" if cov_pct is not None else f"D{drone_id} Map"
+
+            self._draw_map_panel(
+                map_x, map_y, map_width, map_height,
+                title, color, wb, grid_size,
+                searched_cells=searched_cells,
+                frontier_cells=frontiers_by_drone,
+                wall_segments=wall_segments,
+                drone_positions=drone_positions,
+                features=features,
+            )
+
+        # Show "+N more" if more drones than displayed
+        if len(drone_maps_data) > display_count:
+            extra = len(drone_maps_data) - display_count
+            extra_y = start_y + display_count * (map_height + map_spacing)
+            extra_surf = self.font_medium.render(f"+{extra} more drone maps", True, Colors.DARK_GRAY)
+            self.screen.blit(extra_surf, (start_x + 10, extra_y))
     
     def draw_search_debug(self, debug_info: dict, drone_pos: Tuple[float, float]):
         """Draw search debug: path dots, doorways, target, stats."""

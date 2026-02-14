@@ -242,8 +242,8 @@ class GossipMap:
         
         self.last_sync[sender_id] = time.time()
         
-        # Only print if we got new data
-        if total_new_searched > 0 or total_new_walls > 0:
+        # Only print significant merges (>5 new cells) to reduce spam
+        if total_new_searched > 5 or total_new_walls > 5:
             print(f"[GOSSIP] D{self.drone_id} merged from D{sender_id}: +{total_new_searched} searched, +{total_new_walls} walls")
         
         return total_new_searched > 0 or total_new_walls > 0

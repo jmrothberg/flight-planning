@@ -15,10 +15,21 @@ class Environment:
     Includes walls, obstacles, and objects of interest.
     """
     
-    def __init__(self, width: float = 50, height: float = 50):
-        """Initialize environment with given dimensions (in meters)."""
-        self.width = width
-        self.height = height
+    def __init__(self, width: float = 50, height: float = 50, building_scale: float = 0.5):
+        """Initialize environment with given dimensions (in meters).
+
+        Args:
+            width: Design width before scaling (meters)
+            height: Design height before scaling (meters)
+            building_scale: Scale factor applied to all building geometry.
+                           0.5 = rooms are half-size (~7-8m), good for 9m LiDAR.
+                           1.0 = original 50m building (rooms ~15-17m).
+        """
+        self._design_width = width
+        self._design_height = height
+        self.building_scale = building_scale
+        self.width = width * building_scale
+        self.height = height * building_scale
         
         # Environment elements
         self.walls = []  # List of wall segments [(x1,y1), (x2,y2)]
@@ -52,17 +63,29 @@ class Environment:
         self.walls = []
         self.obstacles = []
         self.objects_of_interest = []
-        
-        # Generate new layout
+
+        # Layout generators use self.width/self.height for outer walls,
+        # so temporarily restore design-scale dimensions.
+        self.width = self._design_width
+        self.height = self._design_height
+
+        # Generate new layout at design scale (50m)
         self.layout_generators[self.current_layout]()
-        
+
+        # Apply building scale to all generated geometry
+        s = self.building_scale
+        self.walls = [[(x1*s, y1*s), (x2*s, y2*s)] for (x1, y1), (x2, y2) in self.walls]
+        self.obstacles = [(x*s, y*s, r*s) for x, y, r in self.obstacles]
+        self.width = self._design_width * s
+        self.height = self._design_height * s
+
         # Always randomize objects after generating layout
         self.randomize_objects()
-        
+
         # Move to next layout for next time
         self.current_layout = (self.current_layout + 1) % len(self.layout_generators)
-        
-        print(f"Generated building layout #{self.current_layout}/{len(self.layout_generators)}")
+
+        print(f"Generated building layout #{self.current_layout}/{len(self.layout_generators)} ({self.width:.0f}x{self.height:.0f}m)")
     
     def _generate_layout_complex_rooms(self):
         """Generate original complex room layout with corridors and multiple rooms."""

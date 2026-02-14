@@ -42,10 +42,11 @@ class AStarPathfinder:
     Memory efficient implementation suitable for embedded systems.
     """
     
-    def __init__(self, grid_resolution: float = 0.5):
+    def __init__(self, grid_resolution: float = 0.3):
         """Initialize A* pathfinder with grid resolution in meters."""
         self.grid_resolution = grid_resolution
-        self.max_iterations = 3000  # Prevent infinite loops (more robust indoors)
+        self.max_iterations = 5000  # More iterations for finer grid
+        self.nav_radius = 0.2  # Collision radius for pathfinding (drone is 0.2m square, 0.2m wall clearance)
     
     def find_path(self, start: Tuple[float, float], 
                   goal: Tuple[float, float], 
@@ -83,9 +84,8 @@ class AStarPathfinder:
             
             # Check neighbors
             for neighbor_pos in self._get_neighbors(current.x, current.y):
-                # Skip if position is invalid
-                # KNOWN FIX: inflate collision radius slightly to avoid wall grazing
-                if not environment.is_position_valid(neighbor_pos):
+                # Skip if position is invalid (0.35m radius = drone body 0.3m + buffer)
+                if not environment.is_position_valid(neighbor_pos, radius=self.nav_radius):
                     continue
                 
                 neighbor = Node(neighbor_pos[0], neighbor_pos[1])

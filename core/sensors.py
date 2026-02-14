@@ -38,7 +38,7 @@ class IEDSensor:
     - Keep the `IEDReading` schema and `to_text()` format stable.
     """
 
-    def __init__(self, detection_range_m: float = 3.0):  # 3 meters range
+    def __init__(self, detection_range_m: float = 2.0):  # 2 meters range
         self.detection_range_m = detection_range_m
         self.last_reading: Optional[IEDReading] = None
         # IED detector fan configuration

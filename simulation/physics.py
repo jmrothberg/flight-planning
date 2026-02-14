@@ -157,7 +157,7 @@ class PhysicsEngine:
         # Collision detection
         self.ground_level = 0.0
         self.collision_tolerance = 0.1
-        self.wall_collision_radius = 0.5  # Drone radius for wall collisions (increased from 0.3 for safety)
+        self.wall_collision_radius = 0.2  # Drone radius for wall collisions (0.2m square drone, 0.2m wall clearance)
         
         # Wind simulation
         self.wind_enabled = False
@@ -176,8 +176,8 @@ class PhysicsEngine:
         
         # Check if new position is valid (not inside wall)
         if self.environment is not None:
-            if self.environment.is_position_valid((new_x, new_y)):
-                # Position is valid - update
+            if self.environment.is_position_valid((new_x, new_y), radius=0.2):
+                # Position is valid - update (0.35m = drone body 0.3m + small buffer)
                 drone.position[0] = new_x
                 drone.position[1] = new_y
             else:
@@ -364,7 +364,7 @@ class PhysicsEngine:
             drone_pos = (float(drone.position[0]), float(drone.position[1]))
             
             # If drone is in an invalid position (inside wall), it passed through!
-            if not self.environment.is_position_valid(drone_pos):
+            if not self.environment.is_position_valid(drone_pos, radius=0.2):
                 # STOP! Reset velocity and try to find valid position nearby
                 drone.velocity[0] = 0
                 drone.velocity[1] = 0
@@ -376,7 +376,7 @@ class PhysicsEngine:
                         rad = math.radians(angle)
                         test_x = drone.position[0] + radius * math.cos(rad)
                         test_y = drone.position[1] + radius * math.sin(rad)
-                        if self.environment.is_position_valid((test_x, test_y)):
+                        if self.environment.is_position_valid((test_x, test_y), radius=0.2):
                             drone.position[0] = test_x
                             drone.position[1] = test_y
                             found = True

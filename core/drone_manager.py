@@ -34,7 +34,8 @@ class DroneManager:
         (160, 80, 160),   # Plum - Drone 11
     ]
     
-    def __init__(self, count: int = 1, comm_range: float = 10.0):
+    def __init__(self, count: int = 1, comm_range: float = 10.0,
+                 building_width: float = 25.0, building_height: float = 25.0):
         """
         Initialize drone manager.
 
@@ -44,6 +45,8 @@ class DroneManager:
         """
         self.count = max(1, min(12, count))
         self.comm_range = comm_range
+        self._building_width = building_width
+        self._building_height = building_height
         
         # Per-drone instances
         self.drones: List[Drone] = []
@@ -78,6 +81,11 @@ class DroneManager:
         # Key: (grid_x, grid_y), Value: (drone_id, claim_time)
         self.claimed_targets: Dict[Tuple[int, int], Tuple[int, float]] = {}
         self.claim_timeout = 5.0  # seconds before claim expires
+
+        # Sync visualization tracking
+        # List of (timestamp, visual_sender_id, visual_receiver_id)
+        self.recent_syncs: List[Tuple[float, int, int]] = []
+        self._sync_turn: Dict[Tuple[int, int], bool] = {}  # pair -> direction toggle
     
     def initialize(self, entry_point: Tuple[float, float] = (25.0, -3.0)):
         """
@@ -130,12 +138,14 @@ class DroneManager:
             self.gossip_maps.append(gossip)
             
             # Create search algorithm (pass drone_id for identification)
-            search = SystematicMapper(coverage_radius=3.0, drone_id=i)
+            search = SystematicMapper(coverage_radius=2.0, drone_id=i,
+                                      building_width=self._building_width,
+                                      building_height=self._building_height)
             self.search_algorithms.append(search)
             
             # Entry sequence - staggered door entry
             # Keep entry simple - let search algorithm handle spreading
-            door_x = 25.0 + offset_x * 0.5  # Wider offset at door for spacing
+            door_x = entry_point[0] + offset_x * 0.5  # Wider offset at door for spacing
             
             # Simple entry: outside -> inside -> a few meters in
             # Search algorithm will naturally spread drones to different areas
@@ -208,7 +218,7 @@ class DroneManager:
     
     def broadcast_map_updates(self):
         """Have each drone broadcast its map data to neighbors.
-        
+
         FIXED: Also does DIRECT gossip sync between drones in range,
         bypassing potentially broken mesh protocol.
         """
@@ -216,7 +226,10 @@ class DroneManager:
         if now - self.last_gossip_time < self.gossip_interval:
             return
         self.last_gossip_time = now
-        
+
+        # Clean old sync events (keep last 3 seconds for visualization)
+        self.recent_syncs = [(t, s, r) for t, s, r in self.recent_syncs if now - t < 3.0]
+
         # DIRECT gossip sync: check distance between all drone pairs
         # If within comm_range, directly merge gossip data
         for i in range(self.count):
@@ -225,7 +238,6 @@ class DroneManager:
                 pos_i = self.positions.get(i)
                 pos_j = self.positions.get(j)
                 if pos_i and pos_j:
-                    import math
                     dist = math.hypot(pos_j[0] - pos_i[0], pos_j[1] - pos_i[1])
                     if dist <= self.comm_range:
                         # Drones are in range - sync gossip DIRECTLY with force=True
@@ -235,12 +247,23 @@ class DroneManager:
                         # i receives from j, j receives from i (force=True for direct sync)
                         self.gossip_maps[i].merge_remote_update(payload_j, force=True)
                         self.gossip_maps[j].merge_remote_update(payload_i, force=True)
-        
+
+                        # Record sync event with alternating visual sender
+                        pair_key = (i, j)
+                        turn = self._sync_turn.get(pair_key, True)
+                        self._sync_turn[pair_key] = not turn
+                        visual_sender = i if turn else j
+                        visual_receiver = j if turn else i
+                        self.recent_syncs.append((now, visual_sender, visual_receiver))
+
         # Also try mesh broadcast (for multi-hop when it works)
         for i, mesh in enumerate(self.mesh_nodes):
             if mesh.get_neighbors():
                 payload = self.gossip_maps[i].get_sync_payload()
                 mesh.broadcast("MAP_UPDATE", payload)
+
+        # Clean old messages from bus to prevent unbounded growth
+        self.message_bus[:] = [m for m in self.message_bus if now - m.timestamp < 5.0]
     
     def update_search_from_gossip(self, drone_id: int):
         """
@@ -352,7 +375,7 @@ class DroneManager:
     def get_mesh_links(self) -> List[Tuple[int, int]]:
         """
         Get active mesh connections for visualization.
-        
+
         Returns:
             List of (drone_id_1, drone_id_2) tuples for connected drones
         """
@@ -362,6 +385,29 @@ class DroneManager:
                 if i < neighbor_id:  # Avoid duplicates
                     links.append((i, neighbor_id))
         return links
+
+    def get_gossip_links(self) -> List[Tuple[int, int, float]]:
+        """
+        Get drone pairs within direct gossip range (distance-based check).
+        More reliable than mesh protocol HELLO beacons.
+
+        Returns:
+            List of (drone_id_1, drone_id_2, distance) tuples
+        """
+        links = []
+        for i in range(self.count):
+            for j in range(i + 1, self.count):
+                pos_i = self.positions.get(i)
+                pos_j = self.positions.get(j)
+                if pos_i and pos_j:
+                    dist = math.hypot(pos_j[0] - pos_i[0], pos_j[1] - pos_i[1])
+                    if dist <= self.comm_range:
+                        links.append((i, j, dist))
+        return links
+
+    def get_recent_syncs(self) -> List[Tuple[float, int, int]]:
+        """Get recent sync events for visualization (timestamp, sender_id, receiver_id)."""
+        return self.recent_syncs
     
     def get_all_searched_by_drone(self) -> Dict[int, Set[Tuple[int, int]]]:
         """
@@ -380,30 +426,30 @@ class DroneManager:
         return self.gossip_maps[0].get_searched_by_drone()
     
     def get_global_coverage_stats(self) -> dict:
-        """Get combined coverage statistics."""
-        if not self.gossip_maps:
+        """Get combined coverage statistics from all search algorithms directly."""
+        if not self.search_algorithms:
             return {"coverage_pct": 0}
-        
-        # Combine all searched cells across all gossip maps
+
+        # Use search algorithms directly (always accurate, no gossip dependency)
         all_searched = set()
         all_free = set()
-        
-        for gossip in self.gossip_maps:
-            all_searched.update(gossip.get_global_searched())
-            all_free.update(gossip.get_global_free())
-        
-        interior_free = len([c for c in all_free if c[1] >= 0])
-        interior_searched = len([c for c in all_searched if c[1] >= 0])
-        
+
+        for search in self.search_algorithms:
+            all_searched.update(search.searched_cells)
+            all_free.update(search.free_cells)
+
+        interior_free = set(c for c in all_free if c[1] >= 0)
+        interior_searched = len(interior_free & all_searched)
+
         coverage_pct = 0
-        if interior_free > 0:
-            coverage_pct = int(100 * interior_searched / interior_free)
-        
+        if len(interior_free) > 0:
+            coverage_pct = int(100 * interior_searched / len(interior_free))
+
         return {
             "coverage_pct": min(coverage_pct, 100),
-            "total_free": interior_free,
+            "total_free": len(interior_free),
             "total_searched": interior_searched,
-            "uncovered": interior_free - interior_searched
+            "uncovered": len(interior_free) - interior_searched
         }
     
     def set_comm_range(self, new_range: float):

@@ -16,6 +16,7 @@ class Drone:
     def __init__(self, position: Tuple[float, float, float] = (0, 0, 0)):
         """Initialize drone with starting position (x, y, z)."""
         # State variables
+        self._initial_position = np.array(position, dtype=np.float32)
         self.position = np.array(position, dtype=np.float32)
         self.velocity = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.orientation = 0.0  # Yaw angle in radians
@@ -116,8 +117,7 @@ class Drone:
     
     def reset(self):
         """Reset drone to initial state."""
-        # Restore original entry approach used at startup: near bottom door (25,-3,3)
-        self.position = np.array([25, -3, 3], dtype=np.float32)
+        self.position = self._initial_position.copy()
         self.velocity = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.orientation = 0.0
         self.angular_velocity = 0.0
