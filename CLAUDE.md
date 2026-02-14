@@ -29,20 +29,48 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 | `simulation/environment.py` | Building layouts (5 generators), LiDAR simulation |
 | `simulation/graphics.py` | Rendering — minimaps, drone maps, UI panels |
 
-## Current State (V11.8)
+## Current State (V11.9)
 
 ### What Works
 - Entry sequence (fly to door, enter building, 360 deg scan on entry)
 - LiDAR mapping (59 deg FoV cone + rotation scans every 1.5s for 360 deg awareness)
 - A* pathfinding with wall collision avoidance
-- Bonus-based target scoring (replaces old hard two-phase separation)
+- Bonus-based target scoring with region richness (pulls to big unsearched areas)
 - Return timing with distance-based safety margin
 - Multi-drone gossip protocol (data flow is correctly wired)
 - Per-drone independent timers: 6 min forced return, 7 min battery death
-- Wall-aware spatial penalty (drones separated by walls don't interfere)
+- Distance-based spatial penalty (pushes drones apart, even through walls)
 - Global coverage computed from search algorithms directly (not gossip)
 - Door-stuck blacklisting (unreachable targets auto-blacklisted)
+- IED detection at actual IED position (not drone position)
+- Screenshots: per-drone mid (3 min) + per-drone done (no global sim screenshots)
 - UI: discovered map, per-drone maps, coverage stats, sync indicators
+
+## DESIGN PRINCIPLES
+
+### LiDAR-Only Search
+Drones must navigate and search using ONLY what they discover via LiDAR.
+NEVER use pre-programmed building knowledge (zones, floor plans, room layouts)
+for search decisions. The building is UNKNOWN until scanned. Shared data from
+other drones (via gossip radio) is allowed because it's sensor-derived.
+
+### Scalability (N Drones)
+All multi-drone logic MUST scale to 3, 4, ... N drones. Never hard-code
+assumptions about 2 drones. The spatial penalty, gossip protocol, coverage
+stats, and target scoring all use loops over `drone_manager.count`.
+When adding multi-drone features, always think: "does this work for 12 drones?"
+
+### Future: 3D, Multi-Floor, Hallways
+The current simulation is 2D for simplification. Future versions will add:
+- Multiple floors (stairs/elevators as vertical connections)
+- Hallways and corridors (long narrow spaces)
+- Tunnels and underground structures
+- Full 3D navigation (altitude as third coordinate)
+
+Design search algorithms so they don't assume 2D. The BFS flood-fill,
+A* pathfinding, and grid-based coverage can all extend to 3D by adding
+a Z coordinate to grid cells. The gossip protocol is already dimension-agnostic.
+Keep the grid abstraction clean — when 3D arrives, the grid becomes voxels.
 
 ## Architecture Notes
 
@@ -137,6 +165,19 @@ Per-drone (independent timers, start when drone LAUNCHES — first frame):
 - A* nav radius: 0.2m, grid resolution: 0.3m
 
 ## CRITICAL BUGS FOUND AND FIXED — DO NOT REINTRODUCE
+
+### Bug: IED Labels at Wrong Positions (drone pos instead of IED pos)
+**File:** `core/sensors.py`, `simulation_main.py` lines ~555, ~1772
+**Symptom:** "IED!" labels appear at multiple wrong locations on maps.
+The actual IED is in one room but labels scatter across the building.
+**Root cause:** `add_ied_detection()` and `add_local_feature("ied", ...)` were
+called with the DRONE's position, not the actual IED position. The IED sensor
+knew the IED location (to calculate distance) but didn't return it.
+**Fix:** Added `ied_position` field to `IEDReading`. Both single-drone and
+multi-drone detection paths now use `ied_reading.ied_position` as the label
+coordinate. The IED sensor already had the position — it just wasn't returned.
+**NEVER:** Use drone position as IED detection position. The sensor knows where
+the IED is — always use `ied_reading.ied_position`.
 
 ### Bug: Door-Stuck Loop (target cleared but not searched)
 **File:** `core/search_systematic_mapper.py`, `get_next_waypoint()` lines ~177-181

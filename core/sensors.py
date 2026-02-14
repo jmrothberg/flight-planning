@@ -22,6 +22,7 @@ class IEDReading:
     components: Dict[str, float]
     distance_m: float
     confidence: float
+    ied_position: Optional[Tuple[float, float]] = None  # Actual IED world coords
 
     def to_text(self) -> str:
         """Simple text representation used both in simulation and on real systems."""
@@ -92,7 +93,8 @@ class IEDSensor:
             "casing": max(0.0, min(1.0, 0.4 * norm + noise())),
         }
         confidence = max(0.0, min(1.0, norm))
-        return IEDReading(components=components, distance_m=min_dist, confidence=confidence)
+        return IEDReading(components=components, distance_m=min_dist, confidence=confidence,
+                          ied_position=(nearest[0], nearest[1]))
 
     # def read_hardware(self) -> Optional[IEDReading]:
     #     """REAL SENSOR: Replace with hardware read returning IEDReading."""

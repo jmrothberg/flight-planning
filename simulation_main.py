@@ -551,11 +551,9 @@ class DroneSimulation:
             text = ied_reading.to_text()
             print(f"IED ALERT: {text}")
             
-            # Add IED detection to minimap
-            self.minimap.add_ied_detection(
-                (float(self.drone.position[0]), float(self.drone.position[1])),
-                ied_reading.confidence
-            )
+            # Add IED detection to minimap at the ACTUAL IED position
+            ied_pos = ied_reading.ied_position or (float(self.drone.position[0]), float(self.drone.position[1]))
+            self.minimap.add_ied_detection(ied_pos, ied_reading.confidence)
             
             # Send as a high-priority message too
             self.comm.message_queue.put(Message(
@@ -1769,7 +1767,9 @@ class DroneSimulation:
             )
             if ied_reading and ied_reading.confidence > 0.2:
                 print(f"Drone {i} IED ALERT: {ied_reading.to_text()}")
-                gossip.add_local_feature("ied", drone.position[:2], ied_reading.confidence)
+                # Use actual IED position, not drone position
+                ied_pos = ied_reading.ied_position or tuple(drone.position[:2])
+                gossip.add_local_feature("ied", ied_pos, ied_reading.confidence)
         
         # Gossip sync now happens in Phase 1-2 at START of this function
     
