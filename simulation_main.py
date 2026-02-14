@@ -156,6 +156,7 @@ class DroneSimulation:
         # Video recording state (must be before AUTO_START which calls _start_video_recording)
         self._video_writer: Optional[cv2.VideoWriter] = None
         self._video_frame_count: int = 0
+        self._video_frames_written: int = 0
         self._video_filename: str = ""
 
         # AUTO-RUN: Auto-start mission if enabled
@@ -1932,18 +1933,13 @@ class DroneSimulation:
         if self._video_writer is not None:
             self._finalize_video()
         self._video_frame_count = 0
+        self._video_frames_written = 0
         self._video_filename = "_recording_in_progress.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         w, h = self.window_size
-        # Use H.264 (avc1) — produces universally playable MP4 on macOS.
-        # mp4v (MPEG-4 Visual) creates files that QuickTime rejects as "broken".
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         self._video_writer = cv2.VideoWriter(self._video_filename, fourcc, 20, (w, h))
-        if not self._video_writer.isOpened():
-            # Fallback to mp4v if avc1 not available
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self._video_writer = cv2.VideoWriter(self._video_filename, fourcc, 20, (w, h))
         if self._video_writer.isOpened():
-            print(f"Video recording started ({w}x{h} @ 20fps, H.264)")
+            print(f"Video recording started ({w}x{h} @ 20fps)")
         else:
             print("WARNING: Failed to open video writer")
             self._video_writer = None
@@ -1960,16 +1956,31 @@ class DroneSimulation:
         frame = np.transpose(frame, (1, 0, 2))     # (H, W, 3)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         self._video_writer.write(frame)
+        self._video_frames_written += 1
 
     def _finalize_video(self):
         """Finalize the video recording: release writer and rename to final filename."""
         if self._video_writer is None:
             return
+        frames = getattr(self, '_video_frames_written', 0)
         try:
             self._video_writer.release()
         except Exception as e:
             print(f"WARNING: Error releasing video writer: {e}")
         self._video_writer = None
+
+        # If too few frames written, delete the junk file instead of saving it
+        if frames < 20:  # Less than 1 second of video at 20fps
+            try:
+                if os.path.exists(self._video_filename):
+                    os.remove(self._video_filename)
+                    print(f"Discarded tiny video ({frames} frames)")
+            except Exception:
+                pass
+            self._video_frame_count = 0
+            self._video_frames_written = 0
+            self._video_filename = ""
+            return
 
         # Build final filename matching screenshot convention
         cov = 0
@@ -2010,6 +2021,7 @@ class DroneSimulation:
             print(f"Error renaming video: {e}")
 
         self._video_frame_count = 0
+        self._video_frames_written = 0
         self._video_filename = ""
 
     def _reset_simulation(self):
