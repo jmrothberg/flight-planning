@@ -64,7 +64,7 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 score = bfs_distance (through free cells, respects walls)
       - 8   if frontier cell (adjacent to unknown space)
       - 5   extra "doorway" bonus if frontier has both free+unknown neighbors
-      - min(richness*0.6, 18)  REGION RICHNESS: unsearched cells in 3-cell radius
+      - min(richness*0.7, 22)  REGION RICHNESS: unsearched cells in 3-cell radius (ALL candidates)
       + 2   if wall cell
       + 15  if claimed by another drone
       + (15-d)*1.3  if within 15m of another drone AND no wall between (wall-aware!)
@@ -72,8 +72,10 @@ score = bfs_distance (through free cells, respects walls)
       - 1.0 if adjacent to recently searched cell
       - 0.5*N if rush mode (N = unsearched neighbors count)
 ```
-Lowest score wins. Region richness is the key to making the drone go to big
-unexplored areas instead of picking off small frontier pockets near explored space.
+Lowest score wins. Region richness applies to ALL candidates (not just frontiers)
+because gossip can de-frontier cells by filling in "unknown" neighbors with other
+drones' free_cells. Without richness on non-frontier cells, drones ignore big
+unsearched areas that lost frontier status via gossip sync.
 
 ### Stuck Detection
 - Position sampled every 0.4s simulated, keep last 10 samples
@@ -235,6 +237,19 @@ entry sequence), not when it launches. Entry takes 5-15 seconds.
 **Fix:** Set ALL `mission_start_times` on the first call to `_update_multi_drone()`.
 Removed the overwrite on building entry.
 **NEVER:** Set `mission_start_times` on building entry. Battery drains from launch.
+
+### Bug: Drone Ignores Big Unsearched Areas (gossip de-frontiers cells)
+**File:** `core/search_systematic_mapper.py`, `_find_best_target()` richness computation
+**Symptom:** Yellow frontier markers visible but drone re-covers explored territory.
+**Root cause:** Region richness bonus only applied to FRONTIER cells (adjacent to unknown
+space). In multi-drone mode, gossip syncs other drones' free_cells, which fills in the
+"unknown" neighbors of frontier cells. They lose frontier status AND the richness bonus.
+A de-frontiered cell at BFS distance 15 with no bonus (score: 15) loses to a nearby
+non-frontier cell at BFS distance 2 (score: 2). The drone picks the nearby explored area.
+**Fix:** Compute richness for ALL candidates (not just frontiers). Moved richness bonus
+out of the `if c in exploration_cells:` block. Increased cap from -18 to -22 so big
+unsearched regions pull the drone even from across the building (max BFS ~24 on 2m grid).
+**NEVER:** Limit richness bonus to frontier cells only. Gossip WILL de-frontier cells.
 
 ### Bug: Combined Map Missing Frontier Markers
 **File:** `simulation_main.py`, minimap data construction (~line 1024)

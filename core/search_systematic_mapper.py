@@ -479,20 +479,22 @@ class SystematicMapper:
             if unknown_count > 0:
                 exploration_cells[c] = unknown_count
 
-        # Pre-compute region richness for frontier cells:
+        # Pre-compute region richness for ALL candidates (not just frontiers):
         # Count unsearched free cells in a 3-cell radius (6m).
-        # Frontiers near big white (unsearched) areas get a strong pull bonus.
-        # This makes the drone go to the big unexplored region instead of
-        # picking off small frontier pockets near already-explored areas.
-        frontier_richness = {}
-        for c in exploration_cells:
+        # ANY cell in a big unsearched region gets a pull bonus.
+        # CRITICAL: Must apply to ALL candidates, not just frontier cells!
+        # In multi-drone mode, gossip can de-frontier cells (other drone's free_cells
+        # fill in the "unknown" neighbors). Without richness on non-frontier cells,
+        # the drone ignores big unsearched areas that lost frontier status via gossip.
+        candidate_richness = {}
+        for c in candidates:
             count = 0
             for rx in range(-3, 4):
                 for ry in range(-3, 4):
                     nc = (c[0] + rx, c[1] + ry)
                     if nc in combined_free and nc not in searched_set:
                         count += 1
-            frontier_richness[c] = count
+            candidate_richness[c] = count
 
         def cell_score(c):
             # Base: BFS distance through free space (not Manhattan!)
@@ -521,13 +523,14 @@ class SystematicMapper:
                 if has_free_neighbor and unknown_count >= 1:
                     dist -= 5  # Doorway bonus — aggressively targets room entrances
 
-                # REGION RICHNESS: prefer frontiers near large unsearched areas.
-                # A frontier next to 30 unsearched cells (big white space) is worth
-                # traveling far for.  A frontier next to 3 unsearched cells (small
-                # pocket near explored area) is not.
-                richness = frontier_richness.get(c, 0)
-                if richness > 3:
-                    dist -= min(richness * 0.6, 18)  # Up to -18 for rich regions
+            # REGION RICHNESS: prefer ANY cell near large unsearched areas.
+            # Applied to ALL candidates (not just frontiers!) because gossip
+            # can de-frontier cells by filling in "unknown" neighbors with
+            # other drones' free_cells. Without this, the drone ignores big
+            # unsearched areas that lost frontier status.
+            richness = candidate_richness.get(c, 0)
+            if richness > 3:
+                dist -= min(richness * 0.7, 22)  # Up to -22 for rich regions
 
             # WALL PENALTY: Slight penalty for wall_cells (may get stuck)
             if c in self.wall_cells:
