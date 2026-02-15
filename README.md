@@ -1,118 +1,153 @@
 # Drone IED Search Simulation
 
-An autonomous drone simulation system for searching unknown buildings to locate IEDs (Improvised Explosive Devices). The simulation models real drone hardware — ST 3D ToF LiDAR, OV2640 camera, STM32WL sub-GHz mesh radio, and 900 MHz long-range control link — so that simulation behavior accurately predicts real-world drone performance.
+Autonomous drone swarm simulation for searching unknown buildings to locate IEDs.
+Each drone has 3 processors that handle flight, AI/mapping, and radio independently
+— exactly matching the real hardware architecture.
 
-## Mission
+## Quick Start
 
-Indoor search & rescue and hazard (IED-like) detection using a cooperative swarm. Each drone maps rooms, identifies people/objects with onboard AI, shares small map updates over mesh, and maintains a long-range pilot link.
+```bash
+python3 simulation_gui.py
+```
 
-## Mission Objectives
+Auto-starts on launch. Press **D** to add drones (1-12). Press **R** to reset.
 
-1. **Search an UNKNOWN building** - The drone has NO prior knowledge of the building layout
-2. **Detect IEDs** - IED sensor has 2-meter range; must pass within 2m to detect
-3. **Complete coverage** - Systematically cover all accessible areas
-4. **Return safely** - Must return to start position before 7-minute time limit
-5. **Don't get stuck** - Navigate around obstacles without getting trapped
+## The 3-Processor Architecture
 
-## Key Constraints
+Each physical drone has 3 chips connected via SPI and UART buses.
+The code is organized the same way — one directory per processor:
 
-- **Building is completely unknown** - Only LiDAR and camera data reveal the layout
-- **LiDAR-only navigation** - Drones use ONLY sensor data, never pre-programmed building knowledge
-- **7-minute time limit** - 6 min forced return, 7 min battery death (per drone)
-- **2-meter IED detection range** - Requires close proximity scanning
-- **Must return home** - All data is lost if drone doesn't return
+```
+                    ┌─────────────────────────────────┐
+                    │         Per-Drone Hardware       │
+                    │                                  │
+  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+  │   STM32H7   │   │   STM32N6   │   │   STM32WL   │
+  │   Flight    │◄──│   Neural    │◄──│    Mesh     │
+  │  Controller │──►│  Processor  │──►│    Radio    │
+  └─────────────┘   └─────────────┘   └─────────────┘
+   Motor control     LiDAR + Camera    Gossip protocol
+   PID loops         SLAM mapping      Map sharing
+   GPS, battery      Search algorithm  Drone-to-drone
+   IMU fusion        A* pathfinding    LoRa sub-GHz
+```
 
-## Real Hardware Electronics Stack (150 g class)
+### What Each Processor Does
 
-### System Architecture
+| Processor | Chip | Clock | Role |
+|-----------|------|-------|------|
+| **H7** | STM32H755 Cortex-M7 | 480 MHz | Keeps the drone flying. PID stabilization at 400 Hz, motor control, GPS/IMU sensor fusion, battery monitoring, failsafe |
+| **N6** | STM32N6 NPU+M55 | 800 MHz | The "brain." Processes LiDAR scans, builds a map (SLAM), runs the search algorithm to pick targets, computes A* paths, detects IEDs and objects |
+| **WL** | STM32WL sub-GHz | 48 MHz | The radio. Shares maps between drones using a gossip protocol over LoRa mesh. Discovers neighbors, broadcasts IED alerts |
 
-| Processor | Role |
-|-----------|------|
-| **STM32H7** | Flight control, stabilization, navigation, motor control, failsafe |
-| **STM32N6** | Camera + LiDAR processing, AI inference, object detection, semantic mapping |
-| **STM32WL** | Sub-GHz mesh radio for building/tunnel drone-to-drone communication |
-| **900 MHz long-range radio** | Pilot command, telemetry, emergency control link (RFD900x-class) |
+### How They Talk to Each Other
 
-**Data flow:** Camera + LiDAR -> STM32N6 -> detections/map updates -> STM32H7 -> mesh radio (STM32WL). STM32H7 also connects to the 900 MHz control radio for operator link and failsafe.
+Data flows between processors via typed messages defined in `core/processor_bus.py`:
 
-### Sensors
+```
+H7 ──PositionUpdate──► N6     (x, y, z, orientation, battery) @ 100 Hz via SPI
+N6 ──WaypointCommand──► H7    (target x, y, z) @ 10 Hz via SPI
+N6 ──LocalMapData────► WL     (searched/free/wall cells for gossip broadcast)
+WL ──RemoteMapData───► N6     (other drones' map data received via radio)
+H7 ──PositionBeacon──► WL     (drone_id, position) @ 1 Hz via UART
+```
 
-| Sensor | Part | Notes |
-|--------|------|-------|
-| **LiDAR** | ST 3D ToF 54x42 | 71 deg diagonal FoV, 9m range, depth grid |
-| **Camera** | OV2640 | Low-weight JPEG camera for AI object detection |
-| **IED Sensor** | (application-specific) | 2m detection range |
+## The 4 Programs
 
-### Radios (two independent links)
+| Program | What it is | On real hardware? |
+|---------|-----------|-------------------|
+| `core/stm32h7/stm32h7_main.py` | Flight controller app (H7 firmware) | Yes — runs on the H7 chip |
+| `core/stm32n6/stm32n6_main.py` | Neural processor app (N6 firmware) | Yes — runs on the N6 chip |
+| `core/stm32wl/stm32wl_main.py` | Mesh radio app (WL firmware) | Yes — runs on the WL chip |
+| `simulation_gui.py` | Simulation: creates the world, wires processors, runs GUI | No — the world is real on hardware |
 
-| Radio | Part | Purpose |
-|-------|------|---------|
-| **Mesh radio** | STM32WL sub-GHz module | Drone-to-drone mesh inside buildings/tunnels |
-| **Control radio** | 900 MHz long-range (RFD900x-class) | Pilot command, telemetry, emergency failsafe |
+## Directory Structure
 
-### Cost Estimates
+```
+flight_planning/
+├── simulation_gui.py              # Simulation entry point (the "world" + GUI)
+├── algorithm_config.py            # Search algorithm selection
+├── requirements.txt
+├── CLAUDE.md                      # AI assistant notes & bug documentation
+│
+├── core/                          # ── Drone brain (maps to real hardware) ──
+│   ├── __init__.py                # Architecture documentation
+│   ├── processor_bus.py           # Inter-processor message types (SPI/UART)
+│   ├── drone_manager.py           # Multi-drone orchestration (sim-level)
+│   │
+│   ├── stm32h7/                   # ── H7: Flight Controller ──
+│   │   ├── drone.py               # Drone physics, PID controller, motors
+│   │   └── stm32h7_main.py       # FlightControllerApp (HAL + main loop)
+│   │
+│   ├── stm32n6/                   # ── N6: Neural Processor ──
+│   │   ├── search_systematic_mapper.py  # THE search algorithm (target scoring)
+│   │   ├── navigation.py          # A* pathfinding (0.3m grid)
+│   │   ├── sensors.py             # IED sensor (2m range)
+│   │   ├── slam.py                # SLAM occupancy grid mapping
+│   │   ├── vision.py              # Camera AI object detection
+│   │   ├── minimap.py             # Real-time discovered map
+│   │   └── stm32n6_main.py       # NeuralProcessorApp (main loop)
+│   │
+│   ├── stm32wl/                   # ── WL: Mesh Radio ──
+│   │   ├── mesh_network.py        # Sub-GHz mesh with packet loss model
+│   │   ├── gossip_map.py          # Distributed map sharing protocol
+│   │   ├── communication.py       # Protocol stack, priority queue
+│   │   └── stm32wl_main.py       # MeshRadioApp (main loop)
+│
+├── simulation/                    # ── Simulated world (NOT on any chip) ──
+│   ├── environment.py             # Building layouts, LiDAR ray-casting
+│   ├── graphics.py                # Pygame rendering, minimaps, UI panels
+│   └── physics.py                 # Drone flight dynamics, wall collision
+```
 
-| Phase | Per-drone electronics |
-|-------|----------------------|
-| Prototyping (dev boards) | ~$500-900 total |
-| Early builds | ~$200-350 per drone |
-| Production (1k+ units) | ~$100-180 per drone |
+## How a Mission Works
 
-## Hardware-Matched Simulation
+1. **Simulation creates a building** with random layout, places IEDs inside
+2. **Each drone gets 3 processor apps** (H7, N6, WL) — one instance per chip
+3. **Drone flies to the door** — H7 handles flight, approaches laser-targeted entry point
+4. **Enters building, does 360° scan** — N6 processes LiDAR, builds initial map
+5. **N6 picks search targets** using BFS-distance scoring with frontier/richness bonuses
+6. **N6 sends WaypointCommand to H7** — H7 navigates there with PID + collision avoidance
+7. **H7 sends PositionUpdate back to N6** — N6 updates map, marks cells as searched
+8. **WL gossips map to neighbors** — other drones learn what this drone has mapped
+9. **Repeat until 6 min** — forced return home. At 7 min battery dies.
 
-The simulation models the real sensors and radios so behavior translates directly to hardware.
+## Key Hardware Specs (Modeled in Simulation)
 
-### LiDAR — ST 3D ToF 54x42
+| Component | Specification |
+|-----------|--------------|
+| LiDAR | ST 3D ToF: 54 rays, 59° HFoV, 9m range |
+| Camera | OV2640 → STM32N6 AI inference |
+| IED sensor | 2m detection range |
+| Grid resolution | 2m cells (matches IED sensor) |
+| Mesh radio | Sub-GHz LoRa, 12.5 KB/s, distance-based loss |
+| Max speed | 2.0 m/s |
+| Battery | 6 min search + 1 min return = 7 min total |
+| Wall collision | 0.2m radius pushback |
+| A* grid | 0.3m resolution, 5000 max iterations |
 
-| Parameter | Value |
-|-----------|-------|
-| Sensor | ST 3D ToF 54x42 depth grid |
-| Horizontal FoV | 59 deg (derived from 71 deg diagonal, 54:42 aspect) |
-| Horizontal resolution | 54 rays (one per column) |
-| Max range | 9 meters |
-| Scan behavior | Forward-facing cone; drone rotates periodically to build 360 deg awareness |
+## Controls
 
-The simulation casts 54 rays across a 59 deg cone centered on the drone's heading. Every 1.5 simulated seconds the drone takes additional scans at rotated orientations to accumulate full-surround map data from the limited field of view.
+| Key | Action |
+|-----|--------|
+| **SPACE** | Start/Stop Mission |
+| **R** | Reset Simulation |
+| **D** | Cycle Drone Count (1-12) |
+| **N** | New Object Placement (same building) |
+| **B** | New Building Layout |
+| **+/-** | Adjust Communication Range |
+| **P** | Save Screenshot |
+| **ESC** | Exit |
 
-### Camera — OV2640
+## Search Algorithm (V11.9)
 
-The OV2640 JPEG camera feeds the STM32N6 for onboard AI inference. In simulation this is modelled by the vision system (`core/vision.py`) which detects people, equipment, hazards, and weapons within an 8m / 60 deg FoV cone.
+The search algorithm runs on the **N6 neural processor** (`core/stm32n6/search_systematic_mapper.py`).
+It picks the next target cell by scoring every unsearched cell:
 
-### Mesh Radio — STM32WL Sub-GHz (or XBee 900 MHz)
-
-The drone-to-drone mesh link is modelled after the STM32WL sub-GHz radio module. The simulation code uses the protocol name `xbee_900mhz` since early prototyping may use either an XBee 900 MHz module or the STM32WL — both operate in the same sub-GHz band with similar characteristics.
-
-| Parameter | Simulated Value |
-|-----------|----------------|
-| Bandwidth | 12.5 KB/s (100 kbps) |
-| Latency | 20-80 ms per hop |
-| Packet loss | 1% (close range) to 15% (max range), distance-dependent |
-| Max fragment size | 200 bytes |
-| Priority queue | CRITICAL(1) > HIGH(2) > MEDIUM(3) > LOW(4) |
-| Topology | Store-and-forward mesh with AODV-style multi-hop routing |
-
-### Control Radio — 900 MHz Long-Range
-
-The pilot/operator link (RFD900x-class) provides command uplink, telemetry downlink, and emergency failsafe. This link is not yet modelled in the simulation — all operator interaction currently happens through the pygame GUI.
-
-## How It Works
-
-### Search Strategy (V11.9)
-1. **LiDAR maps walls** - 54 rays across 59 deg FoV, 9m range; rotation scans every 1.5s
-2. **Camera detects objects** - OV2640 feeds STM32N6 AI for person/hazard/IED identification
-3. **Divide into 2m grid** - IED detector has 2m range, so 2m grid = full coverage
-4. **BFS-distance scoring** - All unsearched cells scored via flood-fill through free space (respects walls)
-5. **Region richness** - Cells near large unsearched areas get strong pull bonus (up to -22)
-6. **Frontier bonus** - Cells adjacent to unknown space get -8 to -17 bonus (discovers new rooms)
-7. **Spatial separation** - Multi-drone: cells near other drones penalized (up to +16 within 20m)
-8. **Share via mesh** - Map updates broadcast to swarm over STM32WL gossip protocol
-9. **Return before time expires** - 6 min forced return, 7 min battery death per drone
-
-### Search Scoring Formula
 ```
 score = bfs_distance (through free cells, respects walls)
-      - min(richness*0.7, 22)  region richness (unsearched cells in 3-cell radius)
-      - 8   if frontier cell (adjacent to unknown space)
+      - min(richness*0.7, 22)  region richness (unsearched in 3-cell radius)
+      - 8   if frontier (adjacent to unknown space)
       - 5   doorway bonus (frontier with both free + unknown neighbors)
       + 2   if wall cell
       + 15  if claimed by another drone
@@ -121,160 +156,62 @@ score = bfs_distance (through free cells, respects walls)
       - 1.0 region completion bonus
       - 0.5*N rush mode (N = unsearched neighbors, after 3 min)
 ```
-Lowest score wins.
+
+**Lowest score wins.** The drone always goes to the best-scoring cell it can reach.
 
 ### Per-Drone Timers
+
 | Time | Action |
 |------|--------|
 | 0-3 min | SEARCH mode — explore with frontier + richness scoring |
 | 3+ min | RUSH mode — prefer clusters of unsearched cells |
 | 6 min | Forced return home (no exceptions) |
-| 7 min | Battery dead — drone stops, mission over |
+| 7 min | Battery dead — drone stops |
 
-### Single Drone Performance
-- Target: **80%+ coverage** in typical buildings
-- BFS-distance scoring discovers rooms through doorways
-- Region richness pulls drone to big unsearched areas
-- Adaptive A* stride navigates doors and corners
+## Multi-Drone Swarm (1-12 Drones)
 
-### Multi-Drone Swarm Mode (1-12 drones)
-- STM32WL / XBee 900 MHz mesh networking with gossip protocol
-- Distance-based spatial separation pushes drones apart
-- Region richness + gossip sync prevents duplicate coverage
-- Global coverage computed from all search algorithms directly
+- Each drone runs its own H7/N6/WL processor stack independently
+- **Gossip protocol** (3-phase, every frame):
+  1. N6 → WL: push local map data (searched/free/wall cells)
+  2. WL ↔ WL: exchange gossip payloads with nearby drones (within comm range)
+  3. WL → N6: feed merged data back into search algorithm
+- **Spatial separation**: cells near other drones get penalty score (up to +16 within 20m)
+- **Global coverage**: computed from all search algorithms directly (not gossip)
 - Per-drone independent timers and screenshots
+
+## Output Files
+
+| File Pattern | Description |
+|-------------|-------------|
+| `d{id}_mid_{time}_{cov}pct.png` | Each drone at 3 min (mid-mission) |
+| `d{id}_done_{time}_{cov}pct.png` | Each drone at completion |
+| `sim_{n}d_{cov}pct_{time}.mp4` | Full mission video recording |
 
 ## Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/jmrothberg/flight-planning.git
 cd flight-planning
-
-# Create virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Run the simulation
-python3 simulation_main.py
+python3 simulation_gui.py
 ```
 
-## Controls
+## Cost Estimates
 
-| Key | Action |
-|-----|--------|
-| **SPACE** | Start/Stop Mission |
-| **R** | Reset Simulation |
-| **N** | New Object Placement (same building) |
-| **B** | New Building Layout |
-| **D** | Cycle Drone Count (1-12) |
-| **+/-** | Adjust Communication Range |
-| **P** | Save Screenshot |
-| **ESC** | Exit |
-
-## Project Structure
-
-```
-flight_planning/
-├── simulation_main.py      # Main entry point - orchestrates all systems
-├── algorithm_config.py     # Search algorithm selection
-├── requirements.txt        # Python dependencies
-├── CLAUDE.md              # AI assistant session notes and bug documentation
-│
-├── core/                  # Portable to real hardware (maps to STM32N6 + STM32H7)
-│   ├── drone.py           # Flight control, waypoint navigation, battery (STM32H7)
-│   ├── slam.py            # Occupancy grid mapping, localization (STM32N6)
-│   ├── navigation.py      # A* pathfinding, exploration planning (STM32H7)
-│   ├── sensors.py         # IED detection with actual IED position (2m range)
-│   ├── vision.py          # Object detection via OV2640 + AI (STM32N6)
-│   ├── communication.py   # STM32WL/XBee mesh protocol, priority queue, fragmentation
-│   ├── minimap.py         # Real-time discovered map tracking
-│   ├── search_systematic_mapper.py  # Grid-based coverage algorithm (V11.9)
-│   ├── drone_manager.py   # Multi-drone orchestration (1-12 drones)
-│   ├── mesh_network.py    # Sub-GHz mesh with distance-based packet loss
-│   └── gossip_map.py      # Distributed map sharing via gossip protocol
-│
-├── simulation/            # Simulation-only (not for real hardware)
-│   ├── environment.py     # Building layouts, ST 3D ToF LiDAR simulation
-│   ├── graphics.py        # Pygame rendering, minimaps, drone maps, UI panels
-│   └── physics.py         # Drone flight dynamics, collisions
-│
-├── d*_mid_*.png          # Per-drone mid-mission screenshots (at 3 min)
-└── d*_done_*.png         # Per-drone completion screenshots
-```
-
-## Core Modules
-
-### Search Algorithm (`core/search_systematic_mapper.py`)
-The brain of the drone navigation (runs on STM32N6):
-- **BFS-distance scoring**: Flood-fill through free space ensures targets behind walls are unreachable
-- **Region richness**: Counts unsearched cells in 3-cell radius; big unsearched areas get up to -22 bonus
-- **Frontier exploration**: Cells adjacent to unknown space get -8 bonus; doorways get -5 extra
-- **Adaptive A* stride**: Tries stride 3, 2, 1 with `is_path_clear` check — commits through doors, follows corners
-- **Navigation escape**: Detects physical stuck (wall collision) and forces escape move
-- **IED detection**: Cardinal neighbors only, wall-checked both sides, no through-wall marking
-- **Multi-drone**: gossip-shared global_searched prevents duplication; spatial penalty pushes apart
-
-### LiDAR Sensor Simulation (`simulation/environment.py`)
-Models the ST 3D ToF 54x42 LiDAR:
-- 54 horizontal rays across 59 deg FoV centered on drone heading
-- 9m max range
-- Returns structured dict: `{ranges, start_angle, angle_step, hfov, num_rays}`
-
-### Multi-Drone Coordination (`core/drone_manager.py`, `core/gossip_map.py`)
-For 1-12 drone swarm missions:
-- Each drone maintains its own search algorithm + gossip map
-- **Gossip data flow** (every frame):
-  1. `sync_local_to_gossip(i)` — each drone's local free/searched/wall cells pushed to its gossip map
-  2. `broadcast_map_updates()` — nearby drones (within comm_range) exchange gossip payloads
-  3. `update_search_from_gossip(i)` — merged gossip data fed back to search algorithm
-- Global coverage computed from search algorithms directly (not gossip — always accurate)
-- Spatial separation penalty: `(20-d)*0.8` within 20m, even through walls
-- Region richness applied to ALL candidates (not just frontiers) — survives gossip de-frontiering
-
-## Output Files
-
-### Screenshots
-- `d{id}_mid_{time}_{cov}pct.png` — Each drone at 3 minutes (half of 6-min return)
-- `d{id}_done_{time}_{cov}pct.png` — Each drone at completion or battery death
-- Single drone = D0, same naming convention
-
-### Videos
-- `sim_{n}d_{cov}pct_{time}.mp4` — Full mission recording, start to last drone finish
-- Tiny videos (<20 frames) are automatically discarded
-
-## Algorithm Versions
-
-| Version | Description |
-|---------|-------------|
-| V11.5h | Conservative return timing |
-| V11.6a | Fixed entry oscillation, optimized timing |
-| V11.7 | Bonus-based frontier exploration, multi-drone gossip |
-| V11.8 | Wall-aware penalties, per-drone timers, door-stuck fixes, nav escape |
-| **V11.9** | **Region richness for all candidates, distance-based spatial separation, IED position fix, simplified screenshots** |
+| Phase | Per-drone electronics |
+|-------|----------------------|
+| Prototyping (dev boards) | ~$500-900 |
+| Early builds | ~$200-350 |
+| Production (1k+ units) | ~$100-180 |
 
 ## Future Roadmap
 
-- **3D Navigation** — Multiple floors, stairs, vertical connections (grid → voxels)
+- **3D Navigation** — Multiple floors, stairs, vertical connections (grid becomes voxels)
 - **Hallways & Tunnels** — Long narrow spaces with limited LiDAR visibility
-- **N-Drone Scaling** — All algorithms designed for 1-12+ drones
 - **900 MHz Control Link** — Pilot telemetry, failsafe simulation
-- **Real Hardware Integration** — STM32H7 + STM32N6 + STM32WL deployment
-
-## Hardware Integration
-
-The `core/` modules are designed for direct portability to real hardware:
-
-| Simulation Module | Target Hardware | Integration Notes |
-|-------------------|-----------------|-------------------|
-| `environment.get_lidar_scan()` | ST 3D ToF 54x42 via STM32N6 | Same dict format `{ranges, start_angle, ...}` |
-| `vision.py` | OV2640 camera via STM32N6 AI | Replace with STM32N6 inference output |
-| `communication.py` / `mesh_network.py` | STM32WL sub-GHz module | Implement `MeshProtocolInterface` for STM32WL SPI/UART |
-| `drone.py` / `navigation.py` | STM32H7 flight controller | Replace `physics.py` with real motor/IMU API |
-| `sensors.py` | IED sensor hardware | Replace with actual sensor interface |
+- **Real Hardware Integration** — Deploy to STM32H7 + STM32N6 + STM32WL
 
 ## License
 

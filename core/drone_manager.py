@@ -7,10 +7,10 @@ from typing import List, Dict, Tuple, Set, Optional
 import time
 import math
 
-from core.drone import Drone
-from core.mesh_network import MeshNode, SimulatedMeshProtocol, MeshMessage
-from core.gossip_map import GossipMap
-from core.search_systematic_mapper import SystematicMapper
+from core.stm32h7.drone import Drone
+from core.stm32wl.mesh_network import MeshNode, SimulatedMeshProtocol, MeshMessage
+from core.stm32wl.gossip_map import GossipMap
+from core.stm32n6.search_systematic_mapper import SystematicMapper
 
 
 class DroneManager:

@@ -8,7 +8,7 @@ import numpy as np
 import math
 import time
 from typing import Tuple, List, Dict, Optional
-from core.vision import Detection, ObjectType
+from core.stm32n6.vision import Detection, ObjectType
 
 class Colors:
     """Color constants for visualization."""
@@ -273,67 +273,57 @@ class GraphicsEngine:
             if end_pos:
                 pygame.draw.circle(self.screen, ray_color, end_pos, 2)
     
+    def _draw_section_header(self, text, panel_x, y, color):
+        """Draw a colored section header with left stripe. Returns y for content."""
+        pygame.draw.rect(self.screen, color, (panel_x + 3, y, 3, 16))
+        self.screen.blit(self.font_medium.render(text, True, color), (panel_x + 10, y))
+        pygame.draw.line(self.screen, color, (panel_x + 5, y + 18), (panel_x + 245, y + 18), 1)
+        return y + 22
+
     def draw_ui(self, drone, slam_system, comm_system, mission_start_time=None, search_method: Optional[str] = None, search_options: Optional[List[str]] = None, search_debug: Optional[Dict] = None, multi_drone_data: Optional[Dict] = None):
-        """Draw user interface elements."""
-        # Draw background panel (narrower: 250px instead of 300px)
+        """Draw right-side UI panel organized by processor responsibility."""
         ui_rect = pygame.Rect(self.window_size[0] - 250, 0, 250, self.window_size[1])
         pygame.draw.rect(self.screen, Colors.LIGHT_GRAY, ui_rect)
         pygame.draw.rect(self.screen, Colors.BLACK, ui_rect, 2)
-        
-        y_offset = 20
-        line_height = 25
-        
-        # Title
-        title = self.font_large.render("Drone Status", True, Colors.BLACK)
-        self.screen.blit(title, (ui_rect.x + 10, y_offset))
-        y_offset += 40
-        
-        # Drone status
+
+        x = ui_rect.x + 10
+        y = 12
+        lh = 17  # compact line height
+
         status = drone.get_status()
-        
-        # Position
-        pos_text = f"Position: ({status['position'][0]:.1f}, {status['position'][1]:.1f}, {status['position'][2]:.1f})"
-        pos_surface = self.font_small.render(pos_text, True, Colors.BLACK)
-        self.screen.blit(pos_surface, (ui_rect.x + 10, y_offset))
-        y_offset += line_height
-        
-        # Direction (heading) and Speed on same row
+        is_multi = multi_drone_data and multi_drone_data.get('drones')
+
+        # ── H7: Flight Controller ───────────────────────────────
+        y = self._draw_section_header("H7: Flight Control", ui_rect.x, y, (60, 100, 200))
+
+        pos_text = f"Pos: ({status['position'][0]:.1f}, {status['position'][1]:.1f}, {status['position'][2]:.1f})"
+        self.screen.blit(self.font_small.render(pos_text, True, Colors.BLACK), (x, y))
+        y += lh
+
         heading_deg = math.degrees(drone.orientation) % 360
         speed_mps = math.sqrt(drone.velocity[0]**2 + drone.velocity[1]**2)
-        dir_text = f"Heading: {heading_deg:.0f}°"
-        speed_text = f"Speed: {speed_mps:.1f} m/s"
-        dir_surface = self.font_small.render(dir_text, True, Colors.BLACK)
-        speed_surface = self.font_small.render(speed_text, True, Colors.BLACK)
-        self.screen.blit(dir_surface, (ui_rect.x + 10, y_offset))
-        self.screen.blit(speed_surface, (ui_rect.x + 120, y_offset))
-        y_offset += line_height
-        
-        # Battery and Timer — per-drone grid or single drone
-        if multi_drone_data and multi_drone_data.get('drones'):
+        self.screen.blit(self.font_small.render(
+            f"Hdg: {heading_deg:.0f}\u00b0  Spd: {speed_mps:.1f} m/s", True, Colors.BLACK), (x, y))
+        y += lh
+
+        if is_multi:
             drones_info = multi_drone_data['drones']
             col_w = 57
             row_h = 26
             grid_x = ui_rect.x + 5
-
             for idx, di in enumerate(drones_info[:12]):
                 col = idx % 4
                 row = idx // 4
                 cx = grid_x + col * col_w
-                cy = y_offset + row * row_h
-
+                cy = y + row * row_h
                 color = di.get('color', Colors.GRAY)
                 elapsed_s = di.get('elapsed', 0)
                 battery = di.get('battery', 100)
                 did = di.get('id', idx)
-
-                # Timer: "D0 1:45"
                 mins = int(elapsed_s // 60)
                 secs = int(elapsed_s % 60)
-                timer_str = f"D{did} {mins}:{secs:02d}"
-                timer_surf = self.font_small.render(timer_str, True, color)
-                self.screen.blit(timer_surf, (cx, cy))
-
-                # Battery bar (thin, color-coded)
+                self.screen.blit(self.font_small.render(
+                    f"D{did} {mins}:{secs:02d}", True, color), (cx, cy))
                 bar_y = cy + 14
                 bar_w = col_w - 6
                 bar_h = 4
@@ -341,20 +331,90 @@ class GraphicsEngine:
                 fill_w = int(bar_w * battery / 100)
                 bar_color = (0, 200, 0) if battery > 50 else (255, 165, 0) if battery > 20 else (255, 0, 0)
                 pygame.draw.rect(self.screen, bar_color, (cx, bar_y, fill_w, bar_h))
-
             num_rows = min(3, (len(drones_info) + 3) // 4)
-            y_offset += num_rows * row_h + 4
+            y += num_rows * row_h + 4
+        else:
+            battery_color = Colors.GREEN if status['battery'] > 50 else Colors.ORANGE if status['battery'] > 20 else Colors.RED
+            self.screen.blit(self.font_small.render(
+                f"Battery: {status['battery']:.1f}%", True, battery_color), (x, y))
+            if mission_start_time is not None:
+                elapsed = mission_start_time
+                minutes = int(elapsed // 60)
+                seconds = int(elapsed % 60)
+                self.screen.blit(self.font_small.render(
+                    f"Time: {minutes:02d}:{seconds:02d}", True, Colors.GREEN), (x + 140, y))
+            y += lh + 3
 
-            # Mesh links and global coverage
+        # ── N6: Neural Processor (Search & Mapping) ─────────────
+        y = self._draw_section_header("N6: Search & Mapping", ui_rect.x, y, (40, 160, 60))
+
+        if search_debug:
+            mode = search_debug.get('mode', 'SEARCH')
+            cov = search_debug.get('coverage_pct', 0)
+            uncov = search_debug.get('uncovered', 0)
+            dist_home = search_debug.get('dist_to_entry', 0)
+
+            mode_color = Colors.BLUE if mode == "RETURN" else Colors.ORANGE if mode == "RUSH" else (40, 160, 60)
+            self.screen.blit(self.font_small.render(
+                f"Mode: {mode}  Coverage: {cov:.0f}%", True, mode_color), (x, y))
+            y += lh
+
+            self.screen.blit(self.font_small.render(
+                f"Exit: {dist_home}m  Uncovered: {uncov} cells", True, Colors.DARK_GRAY), (x, y))
+            y += lh
+
+            free_n = search_debug.get('free_cells', 0)
+            wall_n = search_debug.get('wall_cells', 0)
+            searched_n = search_debug.get('searched_cells', 0)
+            self.screen.blit(self.font_small.render(
+                f"Map: {free_n} free  {wall_n} wall  {searched_n} done", True, Colors.DARK_GRAY), (x, y))
+            y += lh
+
+            failed_n = search_debug.get('failed_targets', 0)
+            if failed_n > 0:
+                self.screen.blit(self.font_small.render(
+                    f"Failed targets: {failed_n}", True, Colors.ORANGE), (x, y))
+                y += lh
+        else:
+            mission_text = f"Mission: {'Complete' if status['mission_complete'] else 'Active'}"
+            self.screen.blit(self.font_small.render(mission_text, True, Colors.BLACK), (x, y))
+            y += lh
+
+        if search_method:
+            self.screen.blit(self.font_small.render(
+                f"Algo: {search_method}", True, Colors.DARK_GRAY), (x, y))
+            y += lh
+
+        self.screen.blit(self.font_small.render(
+            "LiDAR: 59\u00b0/9m  IED: 2m  Grid: 2m", True, Colors.DARK_GRAY), (x, y))
+        y += lh + 3
+
+        # ── WL: Mesh Radio ──────────────────────────────────────
+        y = self._draw_section_header("WL: Mesh Radio", ui_rect.x, y, (200, 130, 0))
+
+        if is_multi:
             mesh_links = multi_drone_data.get('mesh_links', 0)
-            global_cov = multi_drone_data.get('global_coverage', 0)
             comm_range = multi_drone_data.get('comm_range', 0)
             mesh_color = (0, 180, 0) if mesh_links > 0 else (200, 0, 0)
-            mesh_surf = self.font_small.render(f"Mesh: {mesh_links} links  Cov: {global_cov}%", True, mesh_color)
-            self.screen.blit(mesh_surf, (ui_rect.x + 10, y_offset))
-            y_offset += 18
+            self.screen.blit(self.font_small.render(
+                f"Links: {mesh_links}  Range: {comm_range:.0f}m (+/-)", True, mesh_color), (x, y))
+            y += lh
+        else:
+            self.screen.blit(self.font_small.render(
+                "Single drone \u2014 no mesh active", True, Colors.DARK_GRAY), (x, y))
+            y += lh + 3
 
-            # Per-drone status line: "D0:SRCH 45% OK" compact
+        # ── Per-Drone Status (multi-drone only) ────────────────
+        if is_multi:
+            y += 3
+            y = self._draw_section_header("Per-Drone Status", ui_rect.x, y, (100, 100, 100))
+
+            global_cov = multi_drone_data.get('global_coverage', 0)
+            self.screen.blit(self.font_small.render(
+                f"Global Coverage: {global_cov}%", True, Colors.BLACK), (x, y))
+            y += lh
+
+            drones_info = multi_drone_data['drones']
             for di in drones_info[:12]:
                 did = di.get('id', 0)
                 color = di.get('color', Colors.GRAY)
@@ -364,149 +424,56 @@ class GraphicsEngine:
                 merged = di.get('merged_cells', 0)
                 sync_str = "OK" if sync_ok else "--"
                 sync_color = (0, 180, 0) if sync_ok else (150, 150, 150)
-                line = f"D{did}:{st} {cov}%"
-                self.screen.blit(self.font_small.render(line, True, color), (ui_rect.x + 10, y_offset))
-                # Sync + merge count on right
-                info_str = f"+{merged} {sync_str}"
-                self.screen.blit(self.font_small.render(info_str, True, sync_color), (ui_rect.x + 130, y_offset))
-                y_offset += 15
+                self.screen.blit(self.font_small.render(
+                    f"D{did}:{st} {cov}%", True, color), (x, y))
+                self.screen.blit(self.font_small.render(
+                    f"+{merged} {sync_str}", True, sync_color), (ui_rect.x + 130, y))
+                y += 15
+            y += 5
 
-            y_offset += 5
-        else:
-            battery_text = f"Battery: {status['battery']:.1f}%"
-            battery_color = Colors.GREEN if status['battery'] > 50 else Colors.ORANGE if status['battery'] > 20 else Colors.RED
-            battery_surface = self.font_small.render(battery_text, True, battery_color)
-            self.screen.blit(battery_surface, (ui_rect.x + 10, y_offset))
+        # ── Objects Found ───────────────────────────────────────
+        y = self._draw_section_header("Objects Found", ui_rect.x, y, (150, 50, 50))
 
-            if mission_start_time is not None:
-                elapsed = mission_start_time
-                minutes = int(elapsed // 60)
-                seconds = int(elapsed % 60)
-                timer_text = f"Time: {minutes:02d}:{seconds:02d}"
-                timer_surface = self.font_small.render(timer_text, True, Colors.GREEN)
-                self.screen.blit(timer_surface, (ui_rect.x + 150, y_offset))
-
-            y_offset += line_height
-        
-        # Mission status - use search debug info if available
-        if search_debug:
-            mode = search_debug.get('mode', 'SEARCH')
-            cov = search_debug.get('coverage_pct', 0)
-            uncov = search_debug.get('uncovered', 0)
-            dist_home = search_debug.get('dist_to_entry', 0)
-            
-            # Mode with color coding
-            if mode == "RETURN":
-                mode_color = Colors.BLUE
-            elif mode == "RUSH":
-                mode_color = Colors.ORANGE
-            else:
-                mode_color = Colors.BLACK
-            
-            mode_surface = self.font_small.render(f"Mode: {mode}", True, mode_color)
-            self.screen.blit(mode_surface, (ui_rect.x + 10, y_offset))
-            y_offset += line_height
-            
-            # Coverage and uncovered
-            cov_text = f"Coverage: {cov:.0f}%  ({uncov} cells left)"
-            cov_surface = self.font_small.render(cov_text, True, Colors.BLACK)
-            self.screen.blit(cov_surface, (ui_rect.x + 10, y_offset))
-            y_offset += line_height
-            
-            # Distance to entry (important for return)
-            dist_text = f"Dist to exit: {dist_home}m"
-            dist_surface = self.font_small.render(dist_text, True, Colors.BLACK)
-            self.screen.blit(dist_surface, (ui_rect.x + 10, y_offset))
-            y_offset += line_height
-
-            # Mapping stats — concise overview of exploration progress
-            free_n = search_debug.get('free_cells', 0)
-            wall_n = search_debug.get('wall_cells', 0)
-            searched_n = search_debug.get('searched_cells', 0)
-            failed_n = search_debug.get('failed_targets', 0)
-            map_text = f"Map: {free_n} free, {wall_n} wall, {searched_n} searched"
-            map_surface = self.font_small.render(map_text, True, Colors.DARK_GRAY)
-            self.screen.blit(map_surface, (ui_rect.x + 10, y_offset))
-            y_offset += 18
-            if failed_n > 0:
-                fail_text = f"Failed targets: {failed_n}"
-                fail_surface = self.font_small.render(fail_text, True, Colors.ORANGE)
-                self.screen.blit(fail_surface, (ui_rect.x + 10, y_offset))
-                y_offset += 18
-
-            # Sensor spec reminder
-            lidar_text = "LiDAR: 59°/9m | IED: 2m | Grid: 2m"
-            lidar_surface = self.font_small.render(lidar_text, True, Colors.DARK_GRAY)
-            self.screen.blit(lidar_surface, (ui_rect.x + 10, y_offset))
-            y_offset += line_height
-        else:
-            mission_text = f"Mission: {'Complete' if status['mission_complete'] else 'Active'}"
-            mission_surface = self.font_small.render(mission_text, True, Colors.BLACK)
-            self.screen.blit(mission_surface, (ui_rect.x + 10, y_offset))
-            y_offset += line_height
-
-        y_offset += 10  # Small gap
-        
-        # Search method
-        if search_method:
-            algo_surface = self.font_small.render(f"Search: {search_method}", True, Colors.BLACK)
-            self.screen.blit(algo_surface, (ui_rect.x + 10, y_offset))
-            y_offset += line_height + 10
-        
-        # Objects found section
         objects_found = search_debug.get('objects_found', []) if search_debug else []
-        found_title = self.font_medium.render("Objects Found", True, Colors.BLACK)
-        self.screen.blit(found_title, (ui_rect.x + 10, y_offset))
-        y_offset += 25
-        
         if objects_found:
-            for obj_type in objects_found[:8]:  # Limit to 8 items
-                obj_surface = self.font_small.render(f"- {obj_type}", True, Colors.DARK_GRAY)
-                self.screen.blit(obj_surface, (ui_rect.x + 10, y_offset))
-                y_offset += 18
-            if len(objects_found) > 8:
-                more = self.font_small.render(f"  +{len(objects_found)-8} more", True, Colors.DARK_GRAY)
-                self.screen.blit(more, (ui_rect.x + 10, y_offset))
-                y_offset += 18
+            for obj_type in objects_found[:6]:
+                self.screen.blit(self.font_small.render(
+                    f"  {obj_type}", True, Colors.DARK_GRAY), (x, y))
+                y += 16
+            if len(objects_found) > 6:
+                self.screen.blit(self.font_small.render(
+                    f"  +{len(objects_found)-6} more", True, Colors.DARK_GRAY), (x, y))
+                y += 16
         else:
-            none_surface = self.font_small.render("(none yet)", True, Colors.DARK_GRAY)
-            self.screen.blit(none_surface, (ui_rect.x + 10, y_offset))
-            y_offset += 18
-        
-        y_offset += 20
-        
-        # Controls
-        controls_title = self.font_medium.render("Controls", True, Colors.BLACK)
-        self.screen.blit(controls_title, (ui_rect.x + 10, y_offset))
-        y_offset += 25
-        
+            self.screen.blit(self.font_small.render(
+                "(none yet)", True, Colors.DARK_GRAY), (x, y))
+            y += 16
+        y += 5
+
+        # ── Controls ────────────────────────────────────────────
+        y = self._draw_section_header("Controls", ui_rect.x, y, (80, 80, 80))
+
         controls = [
             "SPACE: Start/Stop Mission",
-            "R: Reset Simulation",
-            "D: Add/Cycle Drones",
-            "N: New Object Placement",
-            "B: New Building Layout",
-            "+/-: Comm Range",
-            "P: Save Screenshot",
-            "ESC: Exit"
+            "R: Reset  D: Add Drones (1-12)",
+            "N: New Objects  B: New Building",
+            "+/-: Comm Range  P: Screenshot",
+            "ESC: Exit",
         ]
-        
         for control in controls:
-            control_surface = self.font_small.render(control, True, Colors.BLACK)
-            self.screen.blit(control_surface, (ui_rect.x + 10, y_offset))
-            y_offset += line_height
+            self.screen.blit(self.font_small.render(control, True, Colors.BLACK), (x, y))
+            y += lh
 
-        # Optional: numbered search methods for quick switching
-        if search_options:
-            y_offset += 10
-            self.screen.blit(self.font_medium.render("Search Methods", True, Colors.BLACK), (ui_rect.x + 10, y_offset))
-            y_offset += 28
+        if search_options and len(search_options) > 1:
+            y += 5
+            self.screen.blit(self.font_small.render("Search Methods:", True, Colors.BLACK), (x, y))
+            y += lh
             for idx, name in enumerate(search_options, start=1):
-                line = f"{idx}: {name}"
                 is_active = (search_method == name)
                 color = Colors.GREEN if is_active else Colors.BLACK
-                self.screen.blit(self.font_small.render(line, True, color), (ui_rect.x + 10, y_offset))
-                y_offset += line_height
+                self.screen.blit(self.font_small.render(
+                    f"{idx}: {name}", True, color), (x, y))
+                y += lh
 
     def _draw_map_panel(self, panel_x, panel_y, panel_width, panel_height,
                         title, border_color, world_bounds, grid_size,
