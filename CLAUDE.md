@@ -10,7 +10,7 @@ a gossip protocol to share maps over simulated mesh radio.
 ## How to Run
 
 ```bash
-python3 simulation_main.py
+python3 simulation_gui.py
 ```
 
 Auto-starts mission. Press D to add drones (cycles 1-12). Press R to reset.
@@ -20,11 +20,15 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 
 | File | What it does |
 |------|-------------|
-| `core/search_systematic_mapper.py` | **THE search algorithm** — target selection, scoring, stuck detection, return timing |
-| `simulation_main.py` | Orchestrator — entry sequence, LiDAR feeding, A* navigation, rotation scans |
+| `core/stm32n6/search_systematic_mapper.py` | **THE search algorithm** — target selection, scoring, stuck detection, return timing |
+| `simulation_gui.py` | Orchestrator — entry sequence, LiDAR feeding, A* navigation, rotation scans |
 | `core/drone_manager.py` | Multi-drone — gossip sync, target claiming, spatial separation, global coverage |
-| `core/gossip_map.py` | Distributed map sharing — searched/free/wall cells per drone |
-| `core/navigation.py` | A* pathfinder (0.3m grid, 0.2m nav radius, 5000 max iterations) |
+| `core/stm32wl/gossip_map.py` | Distributed map sharing — searched/free/wall cells per drone |
+| `core/stm32n6/navigation.py` | A* pathfinder (0.3m grid, 0.2m nav radius, 5000 max iterations) |
+| `core/processor_bus.py` | Inter-processor message types (SPI/UART data channels) |
+| `core/stm32h7/stm32h7_main.py` | Flight controller app — PID, motors, GPS, battery |
+| `core/stm32n6/stm32n6_main.py` | Neural processor app — LiDAR, SLAM, search, A* |
+| `core/stm32wl/stm32wl_main.py` | Mesh radio app — gossip protocol, inter-drone comms |
 | `simulation/physics.py` | Wall collision (0.2m radius pushback) |
 | `simulation/environment.py` | Building layouts (5 generators), LiDAR simulation |
 | `simulation/graphics.py` | Rendering — minimaps, drone maps, UI panels |
@@ -167,7 +171,7 @@ Per-drone (independent timers, start when drone LAUNCHES — first frame):
 ## CRITICAL BUGS FOUND AND FIXED — DO NOT REINTRODUCE
 
 ### Bug: IED Labels at Wrong Positions (drone pos instead of IED pos)
-**File:** `core/sensors.py`, `simulation_main.py` lines ~555, ~1772
+**File:** `core/stm32n6/sensors.py`, `simulation_gui.py`
 **Symptom:** "IED!" labels appear at multiple wrong locations on maps.
 The actual IED is in one room but labels scatter across the building.
 **Root cause:** `add_ied_detection()` and `add_local_feature("ied", ...)` were
@@ -180,7 +184,7 @@ coordinate. The IED sensor already had the position — it just wasn't returned.
 the IED is — always use `ied_reading.ied_position`.
 
 ### Bug: Door-Stuck Loop (target cleared but not searched)
-**File:** `core/search_systematic_mapper.py`, `get_next_waypoint()` lines ~177-181
+**File:** `core/stm32n6/search_systematic_mapper.py`, `get_next_waypoint()`
 **Symptom:** Drone circles at the edge of a doorway forever, never passes through.
 **Root cause:** Target is cleared when drone is within 2.5m Euclidean distance.
 But 2.5m Euclidean IGNORES WALLS. The drone can be 2.5m from the target center
@@ -193,7 +197,7 @@ searched. If not, add it to `failed_targets` (blacklisted for 15s).
 drone will loop at every doorway.
 
 ### Bug: Door-Edge Stuck (A* succeeds but drone can't follow path)
-**File:** `simulation_main.py`, `_nav_escape_if_stuck()`
+**File:** `simulation_gui.py`, `_nav_escape_if_stuck()`
 **Symptom:** Drone stuck at door/wall edge for 5-30+ seconds, oscillating.
 **Root cause:** A* finds a valid path through the doorway, so `mark_target_unreachable`
 is NEVER called (it only fires when A* fails). But wall-collision pushback physically
@@ -211,7 +215,7 @@ It's too slow (1.5s per target) and doesn't move the drone. The main loop MUST
 detect navigation stuck independently and force physical escape.
 
 ### Bug: IED Detection Through Walls (green squares behind walls)
-**File:** `core/search_systematic_mapper.py`, neighbor marking ~lines 155-174
+**File:** `core/stm32n6/search_systematic_mapper.py`, neighbor marking
 **Symptom:** A cell on the other side of a wall turns green (marked as searched).
 **Root cause (1):** Diagonal neighbors were marked as searched, but diagonal cell
 centers are 2.83m apart on a 2m grid — beyond the 2m IED detector range. Removed.
@@ -225,7 +229,7 @@ falls on.
 **NEVER:** Only check one side of the wall boundary — always check BOTH cells.
 
 ### Bug: Ghost Drone (dead drone keeps flying)
-**File:** `simulation_main.py`, `_update_multi_drone()` per-drone loop
+**File:** `simulation_gui.py`, `_update_multi_drone()` per-drone loop
 **Symptom:** Drone times out (battery dead) but keeps flying around as a dot.
 **Root cause:** `drone.update(dt)` and `physics.update_drone()` ran BEFORE the
 `mission_complete` check. A dead drone's velocity was still being applied.
@@ -233,7 +237,7 @@ falls on.
 everything: no physics, no movement, no map updates.
 
 ### Bug: A* Fixed Stride Causes Either Door Oscillation OR Corner Stuck
-**File:** `simulation_main.py`, single-drone ~line 700, multi-drone ~line 1556
+**File:** `simulation_gui.py`, A* stride logic
 **Symptom (stride=1):** Drone oscillates at doorway edge, barely moving.
 **Symptom (stride=3):** Drone gets stuck at first corner — aims through wall.
 **Root cause:** A* path follows corners in small 0.3m steps. stride=1 is too
@@ -245,7 +249,7 @@ follows corners (falls back to stride 1 at turns).
 **NEVER:** Use a fixed stride. It will ALWAYS fail at either doors or corners.
 
 ### Bug: Multi-Drone Drones Not Spreading Apart
-**File:** `core/search_systematic_mapper.py`, `cell_score()` spatial penalty
+**File:** `core/stm32n6/search_systematic_mapper.py`, `cell_score()` spatial penalty
 **Symptom:** Drones go to same rooms instead of splitting up across building.
 **Root cause (original V11.7):** Wall check in spatial penalty skipped the penalty
 when drones were in different rooms. Drones in adjacent rooms had zero incentive
@@ -270,7 +274,7 @@ These are always accurate regardless of gossip state.
 **NEVER:** Use gossip maps for coverage stats. They depend on radio range.
 
 ### Bug: D1 Stuck Returning Home
-**File:** `simulation_main.py`, `_update_multi_drone()` return path
+**File:** `simulation_gui.py`, `_update_multi_drone()` return path
 **Root cause:** A* with 5000 max iterations on 0.3m grid can't pathfind 25m
 across an entire building. The drone gets a path failure and inches along via
 emergency escape at 0.15m/frame.
@@ -279,7 +283,7 @@ along the direction toward home. A* handles 5-8m paths reliably.
 **NEVER:** Assume A* can pathfind across the entire building in one shot.
 
 ### Bug: D1 Clock Starts Late (10-15s delay)
-**File:** `simulation_main.py`, `_update_multi_drone()` + entry sequence
+**File:** `simulation_gui.py`, `_update_multi_drone()` + entry sequence
 **Symptom:** D1 clock shows less time than D0 even though both launched together.
 **Root cause:** `mission_start_times[i]` was set when drone enters building (completes
 entry sequence), not when it launches. Entry takes 5-15 seconds.
@@ -288,7 +292,7 @@ Removed the overwrite on building entry.
 **NEVER:** Set `mission_start_times` on building entry. Battery drains from launch.
 
 ### Bug: Drone Ignores Big Unsearched Areas (gossip de-frontiers cells)
-**File:** `core/search_systematic_mapper.py`, `_find_best_target()` richness computation
+**File:** `core/stm32n6/search_systematic_mapper.py`, `_find_best_target()` richness computation
 **Symptom:** Yellow frontier markers visible but drone re-covers explored territory.
 **Root cause:** Region richness bonus only applied to FRONTIER cells (adjacent to unknown
 space). In multi-drone mode, gossip syncs other drones' free_cells, which fills in the
@@ -301,7 +305,7 @@ unsearched regions pull the drone even from across the building (max BFS ~24 on 
 **NEVER:** Limit richness bonus to frontier cells only. Gossip WILL de-frontier cells.
 
 ### Bug: Combined Map Missing Frontier Markers
-**File:** `simulation_main.py`, minimap data construction (~line 1024)
+**File:** `simulation_gui.py`, minimap data construction
 **Symptom:** Individual drone maps (D0 Map, D1 Map) show yellow frontier markers
 that do NOT appear on the combined "Discovered Map."
 **Root cause:** Two different frontier definitions:
@@ -315,7 +319,7 @@ collect all free/searched/wall cells from all drones, then frontier = free - sea
 means "adjacent to unknown" which is not the same as "unsearched."
 
 ### Bug: Escape-Induced Oscillation (breadcrumb clusters)
-**File:** `simulation_main.py`, `_nav_escape_if_stuck()`
+**File:** `simulation_gui.py`, `_nav_escape_if_stuck()`
 **Symptom:** Drone oscillates back and forth near unexplored areas, wasting time.
 Breadcrumbs show overlapping clustered dots.
 **Root cause:** Nav escape timer was too aggressive (0.5s real, no cooldown). Drone
