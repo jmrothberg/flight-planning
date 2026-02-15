@@ -866,6 +866,14 @@ class DroneSimulationGUI:
                                 float(drone.position[0]), float(drone.position[1]),
                                 extra, scan_angle)
 
+            # ── N6: Vision processing (camera object detection) ──────
+            camera_image = self.environment.get_camera_view(drone.position, drone.orientation)
+            detected_objects = self.vision.process_frame(camera_image)
+            if detected_objects:
+                for detection in detected_objects:
+                    obj_type = detection.object_type.value if hasattr(detection.object_type, 'value') else str(detection.object_type)
+                    gossip.add_local_feature(obj_type, detection.position, detection.confidence)
+
             # ── WL→N6: Gossip Phase 3 — push knowledge to search ────
             self.drone_manager.update_search_from_gossip(i)
             claimed = self.drone_manager.get_claimed_by_others(i)
