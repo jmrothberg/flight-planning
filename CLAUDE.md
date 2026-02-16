@@ -91,6 +91,21 @@ Keep the grid abstraction clean — when 3D arrives, the grid becomes voxels.
 - CRITICAL: `feed_lidar_scan()` MUST be called for rotation scans so the search
   algorithm discovers doorways/rooms outside the forward cone
 
+### Camera (Vision System)
+- OV2640 simulated: 60 deg FoV, 8m range
+- Detects objects: person, equipment, hazard, weapon, furniture
+- Occlusion-aware (can't see through walls), confidence decays with distance
+- `environment.get_camera_view()` returns visible objects in FoV
+- `vision.process_frame()` converts to Detection objects (type, position, confidence)
+- Single-drone: detections stored via `minimap.add_vision_detection()`
+- Multi-drone: detections stored via `gossip.add_local_feature()` (shared between drones)
+- Building has 7 randomized objects: 3 people, 1 equipment, 1 hazard, 1 weapon, 1 IED
+
+### IED Sensor
+- 2m proximity range, triggers when drone passes near an IED
+- Returns `IEDReading` with `ied_position` (actual IED location, not drone position)
+- Grid uses 2m cells to match sensor range — visiting every cell = full coverage
+
 ### Search Algorithm Scoring
 ```
 score = bfs_distance (through free cells, respects walls)

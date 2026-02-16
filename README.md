@@ -116,15 +116,32 @@ flight_planning/
 
 | Component | Specification |
 |-----------|--------------|
-| LiDAR | ST 3D ToF: 54 rays, 59° HFoV, 9m range |
-| Camera | OV2640 → STM32N6 AI inference |
-| IED sensor | 2m detection range |
+| LiDAR | ST 3D ToF: 54 rays, 59° HFoV, 9m range — maps walls |
+| Camera | OV2640: 60° FoV, 8m range — detects people, equipment, hazards, weapons |
+| IED sensor | 2m proximity detection — triggers when drone passes near an IED |
 | Grid resolution | 2m cells (matches IED sensor) |
 | Mesh radio | Sub-GHz LoRa, 12.5 KB/s, distance-based loss |
 | Max speed | 2.0 m/s |
 | Battery | 6 min search + 1 min return = 7 min total |
 | Wall collision | 0.2m radius pushback |
 | A* grid | 0.3m resolution, 5000 max iterations |
+
+### Three Sensor Modalities
+
+Each drone has three independent sensors, all processed by the N6 neural processor:
+
+1. **LiDAR** (ST 3D ToF) — 54 rays across 59° HFoV, 9m range. Maps walls and free space.
+   Rotation scans every 1.5s give full 360° awareness. This is the primary navigation sensor.
+
+2. **Camera** (OV2640) — 60° FoV, 8m range. Detects and classifies objects: people, equipment,
+   hazards, weapons, furniture. Confidence decreases with distance. Occlusion-aware (can't see
+   through walls). Detections are shared between drones via the gossip protocol.
+
+3. **IED Sensor** — 2m proximity detector. Triggers when the drone passes within 2m of an IED.
+   This is why the search grid uses 2m cells — visiting every cell guarantees full IED coverage.
+
+The building is populated with randomized objects (3 people, 1 equipment, 1 hazard, 1 weapon,
+1 IED) placed in valid open spaces. Press **N** to re-randomize object positions.
 
 ## Controls
 
