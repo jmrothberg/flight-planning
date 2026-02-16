@@ -249,9 +249,9 @@ class DroneSimulationGUI:
 
     def _discover_search_modules(self) -> list:
         try:
-            core_dir = os.path.join(os.path.dirname(__file__), 'core')
+            core_dir = os.path.join(os.path.dirname(__file__), 'core', 'stm32n6')
         except NameError:
-            core_dir = os.path.join(os.getcwd(), 'core')
+            core_dir = os.path.join(os.getcwd(), 'core', 'stm32n6')
         options = []
         try:
             for fname in sorted(os.listdir(core_dir)):
@@ -262,7 +262,7 @@ class DroneSimulationGUI:
         return options
 
     def _load_search_by_module(self, module_name: str):
-        module = importlib.import_module(f"core.{module_name}")
+        module = importlib.import_module(f"core.stm32n6.{module_name}")
         preferred = [
             'SystematicMapper', 'AutoSearch', 'SystematicSweep',
             'FrontierExplorer', 'SafeExplorer', 'FastIEDSweep',
