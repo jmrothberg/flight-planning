@@ -281,8 +281,11 @@ class GraphicsEngine:
         pygame.draw.line(self.screen, color, (panel_x + 5, y + 18), (panel_x + 245, y + 18), 1)
         return y + 22
 
-    def draw_ui(self, drone, slam_system, comm_system, mission_start_time=None, search_method: Optional[str] = None, search_options: Optional[List[str]] = None, search_debug: Optional[Dict] = None, multi_drone_data: Optional[Dict] = None):
-        """Draw right-side UI panel organized by processor responsibility."""
+    def draw_ui(self, drone, slam_system, comm_system, mission_start_time=None, search_method: Optional[str] = None, search_options: Optional[List[str]] = None, search_debug: Optional[Dict] = None, multi_drone_data: Optional[Dict] = None, selected_drone: Optional[int] = None, manual_mode: Optional[Dict] = None):
+        """Draw right-side UI panel organized by processor responsibility.
+
+        Returns list of (drone_id, pygame.Rect) for mission button click targets."""
+        mission_button_rects = []
         ui_rect = pygame.Rect(self.window_size[0] - 250, 0, 250, self.window_size[1])
         pygame.draw.rect(self.screen, Colors.LIGHT_GRAY, ui_rect)
         pygame.draw.rect(self.screen, Colors.BLACK, ui_rect, 2)
@@ -393,7 +396,8 @@ class GraphicsEngine:
         # ── WL: Mesh Radio ──────────────────────────────────────
         y = self._draw_section_header("WL: Mesh Radio", ui_rect.x, y, (200, 130, 0))
 
-        if is_multi:
+        num_drones = len(multi_drone_data['drones']) if is_multi else 0
+        if num_drones > 1:
             mesh_links = multi_drone_data.get('mesh_links', 0)
             comm_range = multi_drone_data.get('comm_range', 0)
             mesh_color = (0, 180, 0) if mesh_links > 0 else (200, 0, 0)
@@ -405,7 +409,7 @@ class GraphicsEngine:
                 "Single drone \u2014 no mesh active", True, Colors.DARK_GRAY), (x, y))
             y += lh + 3
 
-        # ── Per-Drone Status (multi-drone only) ────────────────
+        # ── Per-Drone Status ──────────────────────────────────
         if is_multi:
             y += 3
             y = self._draw_section_header("Per-Drone Status", ui_rect.x, y, (100, 100, 100))
@@ -423,12 +427,30 @@ class GraphicsEngine:
                 cov = di.get('coverage_pct', 0)
                 sync_ok = di.get('sync_ok', False)
                 merged = di.get('merged_cells', 0)
+                wall_hits = di.get('wall_hits', 0)
+                mission = di.get('mission', 'map')
                 sync_str = "OK" if sync_ok else "--"
                 sync_color = (0, 180, 0) if sync_ok else (150, 150, 150)
+                # Drone status + coverage
                 self.screen.blit(self.font_small.render(
                     f"D{did}:{st} {cov}%", True, color), (x, y))
+                # Mission button [MAP] / [DSTR]
+                mission_label = "MAP" if mission == "map" else "DSTR"
+                btn_bg = (0, 140, 0) if mission == "map" else (200, 0, 0)
+                btn_x = ui_rect.x + 105
+                btn_rect = pygame.Rect(btn_x, y, 34, 14)
+                pygame.draw.rect(self.screen, btn_bg, btn_rect)
+                pygame.draw.rect(self.screen, Colors.BLACK, btn_rect, 1)
+                btn_text = self.font_tiny.render(mission_label, True, Colors.WHITE)
+                self.screen.blit(btn_text, (btn_x + 2, y + 1))
+                mission_button_rects.append((did, btn_rect))
+                # Sync status
                 self.screen.blit(self.font_small.render(
-                    f"+{merged} {sync_str}", True, sync_color), (ui_rect.x + 130, y))
+                    f"{sync_str}", True, sync_color), (ui_rect.x + 145, y))
+                # Wall collision count
+                w_color = Colors.ORANGE if wall_hits > 0 else Colors.GRAY
+                self.screen.blit(self.font_small.render(
+                    f"W:{wall_hits}", True, w_color), (ui_rect.x + 170, y))
                 y += 15
             y += 5
 
@@ -436,6 +458,7 @@ class GraphicsEngine:
         y = self._draw_section_header("Objects Found", ui_rect.x, y, (150, 50, 50))
 
         objects_found = search_debug.get('objects_found', []) if search_debug else []
+        ieds_destroyed = search_debug.get('ieds_destroyed', 0) if search_debug else 0
         if objects_found:
             for obj_type in objects_found[:6]:
                 self.screen.blit(self.font_small.render(
@@ -449,16 +472,30 @@ class GraphicsEngine:
             self.screen.blit(self.font_small.render(
                 "(none yet)", True, Colors.DARK_GRAY), (x, y))
             y += 16
+        if ieds_destroyed > 0:
+            self.screen.blit(self.font_small.render(
+                f"  IED destroyed: {ieds_destroyed}", True, Colors.RED), (x, y))
+            y += 16
         y += 5
 
         # ── Controls ────────────────────────────────────────────
         y = self._draw_section_header("Controls", ui_rect.x, y, (80, 80, 80))
+
+        # Selected drone / manual mode indicator
+        if selected_drone is not None:
+            is_manual = manual_mode.get(selected_drone, False) if manual_mode else False
+            mode_str = "MANUAL" if is_manual else "AUTO"
+            mode_color = Colors.YELLOW if is_manual else Colors.GREEN
+            self.screen.blit(self.font_small.render(
+                f"Selected: D{selected_drone} [{mode_str}]", True, mode_color), (x, y))
+            y += lh
 
         controls = [
             "SPACE: Start/Stop Mission",
             "R: Reset  D: Add Drones (1-12)",
             "N: New Objects  B: New Building",
             "+/-: Comm Range  P: Screenshot",
+            "M: Manual (click drone first)",
             "ESC: Exit",
         ]
         for control in controls:
@@ -475,6 +512,8 @@ class GraphicsEngine:
                 self.screen.blit(self.font_small.render(
                     f"{idx}: {name}", True, color), (x, y))
                 y += lh
+
+        return mission_button_rects
 
     def _draw_map_panel(self, panel_x, panel_y, panel_width, panel_height,
                         title, border_color, world_bounds, grid_size,

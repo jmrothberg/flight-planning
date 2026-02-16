@@ -167,31 +167,44 @@ class PhysicsEngine:
         # Environment reference (set by main simulation)
         self.environment = None
     
-    def update_drone(self, drone, dt: float):
-        """Update drone physics for one time step."""
+    def update_drone(self, drone, dt: float) -> float:
+        """Update drone physics for one time step.
+
+        Returns the speed (m/s) that was blocked by a wall, or 0.0 if no
+        collision.  Only the velocity-zeroing case counts — proximity
+        pushback from ``_handle_collisions`` is normal clearance maintenance."""
+        blocked_speed = 0.0
         # SIMPLE POSITION UPDATE with wall checking
         # Calculate where drone WOULD move to
         new_x = drone.position[0] + drone.velocity[0] * dt
         new_y = drone.position[1] + drone.velocity[1] * dt
-        
-        # Check if new position is valid (not inside wall)
+
+        # Check if new position is valid AND path doesn't cross a wall
         if self.environment is not None:
-            if self.environment.is_position_valid((new_x, new_y), radius=0.2):
-                # Position is valid - update (0.35m = drone body 0.3m + small buffer)
+            cur = (float(drone.position[0]), float(drone.position[1]))
+            nxt = (float(new_x), float(new_y))
+            if (self.environment.is_position_valid(nxt, radius=0.2) and
+                    self.environment.is_path_clear(cur, nxt, radius=0.2)):
+                # Position is valid and path is clear — update
                 drone.position[0] = new_x
                 drone.position[1] = new_y
             else:
-                # Would hit wall - stop velocity
+                # Would hit or cross wall — record speed then stop
+                blocked_speed = math.sqrt(
+                    float(drone.velocity[0]) ** 2 +
+                    float(drone.velocity[1]) ** 2)
                 drone.velocity[0] = 0
                 drone.velocity[1] = 0
         else:
             # No environment to check - just update position
             drone.position[0] = new_x
             drone.position[1] = new_y
-        
+
         # Handle collisions (push back if too close to walls) and constraints
+        # NOTE: pushback is normal proximity maintenance, NOT counted as a collision.
         self._handle_collisions(drone)
         self._apply_constraints(drone)
+        return blocked_speed
     
     def _get_motor_commands_from_drone(self, drone) -> np.ndarray:
         """
@@ -351,24 +364,28 @@ class PhysicsEngine:
         
         return wind_force_magnitude * wind_direction
     
-    def _handle_collisions(self, drone):
-        """Handle collisions with ground and obstacles."""
+    def _handle_collisions(self, drone) -> bool:
+        """Handle collisions with ground and obstacles.
+
+        Returns True if a wall collision (pushback) occurred."""
+        pushed = False
         # Ground collision
         if drone.position[2] < self.ground_level + self.collision_tolerance:
             drone.position[2] = self.ground_level + self.collision_tolerance
             if drone.velocity[2] < 0:
                 drone.velocity[2] = 0  # Stop downward motion
-        
+
         # CRITICAL: Check if current position is valid - if not, stop immediately
         if self.environment is not None:
             drone_pos = (float(drone.position[0]), float(drone.position[1]))
-            
+
             # If drone is in an invalid position (inside wall), it passed through!
             if not self.environment.is_position_valid(drone_pos, radius=0.2):
                 # STOP! Reset velocity and try to find valid position nearby
                 drone.velocity[0] = 0
                 drone.velocity[1] = 0
-                
+                pushed = True
+
                 # Search for nearby valid position
                 for radius in [0.5, 1.0, 1.5, 2.0, 3.0]:
                     found = False
@@ -383,24 +400,26 @@ class PhysicsEngine:
                             break
                     if found:
                         break
-            
+
             # Standard wall collision push-back
             drone_x, drone_y = drone.position[0], drone.position[1]
             for wall in self.environment.walls:
                 dist = self._point_to_line_distance((drone_x, drone_y), wall)
-                
+
                 if dist < self.wall_collision_radius:
+                    pushed = True
                     push_dir = self._get_perpendicular_from_wall((drone_x, drone_y), wall)
                     push_distance = self.wall_collision_radius - dist + 0.1
                     drone.position[0] += push_dir[0] * push_distance
                     drone.position[1] += push_dir[1] * push_distance
-                    
+
                     wall_normal = push_dir
-                    velocity_toward_wall = (drone.velocity[0] * wall_normal[0] + 
+                    velocity_toward_wall = (drone.velocity[0] * wall_normal[0] +
                                           drone.velocity[1] * wall_normal[1])
                     if velocity_toward_wall < 0:
                         drone.velocity[0] -= velocity_toward_wall * wall_normal[0]
                         drone.velocity[1] -= velocity_toward_wall * wall_normal[1]
+        return pushed
     
     def _apply_constraints(self, drone):
         """Apply physical constraints to drone state."""

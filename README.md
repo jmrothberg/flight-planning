@@ -11,6 +11,7 @@ python3 simulation_gui.py
 ```
 
 Auto-starts on launch. Press **D** to add drones (1-12). Press **R** to reset.
+Click a drone then **M** for manual control. Click **[MAP]/[DSTR]** buttons to change mission.
 
 ## The 3-Processor Architecture
 
@@ -97,6 +98,7 @@ flight_planning/
 ├── simulation/                    # ── Simulated world (NOT on any chip) ──
 │   ├── environment.py             # Building layouts, LiDAR ray-casting
 │   ├── graphics.py                # Pygame rendering, minimaps, UI panels
+│   ├── joystick_widget.py         # Manual flight control joystick panel
 │   └── physics.py                 # Drone flight dynamics, wall collision
 ```
 
@@ -145,8 +147,8 @@ The building is populated with randomized objects (3 people, 1 equipment, 1 haza
 
 ## Controls
 
-| Key | Action |
-|-----|--------|
+| Key / Action | Effect |
+|-------------|--------|
 | **SPACE** | Start/Stop Mission |
 | **R** | Reset Simulation |
 | **D** | Cycle Drone Count (1-12) |
@@ -154,6 +156,9 @@ The building is populated with randomized objects (3 people, 1 equipment, 1 haza
 | **B** | New Building Layout |
 | **+/-** | Adjust Communication Range |
 | **P** | Save Screenshot |
+| **M** | Toggle Manual Control (select drone first) |
+| **Click drone** | Select drone (yellow ring) |
+| **Click [MAP]/[DSTR]** | Toggle drone mission (Map or Destroy) |
 | **ESC** | Exit |
 
 ## Search Algorithm (V11.9)
@@ -195,6 +200,45 @@ score = bfs_distance (through free cells, respects walls)
 - **Spatial separation**: cells near other drones get penalty score (up to +16 within 20m)
 - **Global coverage**: computed from all search algorithms directly (not gossip)
 - Per-drone independent timers and screenshots
+
+## Manual Drone Control
+
+Click any drone on the map to select it (yellow ring appears), then press **M** to
+enter manual mode. A dual-stick joystick panel appears in the UI:
+
+- **Left stick** — Forward/back and strafe
+- **Right stick** — Yaw rotation
+- IED sensor stays active during manual flight (cells are still marked as searched)
+- At 6 minutes, manual mode auto-releases for forced return home
+- Press **M** again to release and resume autonomous search
+
+## Per-Drone Missions (Map / Destroy)
+
+Each drone has a mission shown in the Per-Drone Status panel as a clickable button:
+
+| Mission | Button | Behavior |
+|---------|--------|----------|
+| **Map** | `[MAP]` (green) | Default — autonomous search algorithm explores the building |
+| **Destroy** | `[DSTR]` (red) | Fly to a known IED position and destroy it |
+
+**Destroy workflow:**
+1. Click `[MAP]` to toggle a drone to `[DSTR]` mode
+2. If the drone (or any drone via gossip) has already detected an IED, it immediately
+   targets the closest un-destroyed IED and flies there using A* navigation
+3. If no IED is known yet, the drone continues searching. Once an IED is found
+   (by this drone or shared via gossip from another), it auto-targets it
+4. When the drone arrives within 0.5m of the IED, it detonates — the IED is removed
+   from the simulation and marked with a red X on the map
+5. The drone automatically reverts to MAP mode after destruction
+
+The Objects Found panel shows both `ied: N` (total detected) and `IED destroyed: N`
+(total eliminated, in red).
+
+## Wall Collision Reporting
+
+The per-drone status shows `W:N` — a count of real wall impacts. Only collisions where
+the drone was moving >0.5 m/s count (not normal proximity clearance). In autonomous mode
+with LiDAR navigation, this should be 0. Manual flight into walls will increment the counter.
 
 ## Output Files
 

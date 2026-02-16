@@ -14,6 +14,7 @@ python3 simulation_gui.py
 ```
 
 Auto-starts mission. Press D to add drones (cycles 1-12). Press R to reset.
+Click a drone + M for manual control. Click [MAP]/[DSTR] to change mission.
 SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 
 ## Key Files (in order of importance for search issues)
@@ -29,11 +30,12 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 | `core/stm32h7/stm32h7_main.py` | Flight controller app — PID, motors, GPS, battery |
 | `core/stm32n6/stm32n6_main.py` | Neural processor app — LiDAR, SLAM, search, A* |
 | `core/stm32wl/stm32wl_main.py` | Mesh radio app — gossip protocol, inter-drone comms |
-| `simulation/physics.py` | Wall collision (0.2m radius pushback) |
+| `simulation/physics.py` | Wall collision (0.2m pushback), returns blocked speed for collision reporting |
 | `simulation/environment.py` | Building layouts (5 generators), LiDAR simulation |
-| `simulation/graphics.py` | Rendering — minimaps, drone maps, UI panels |
+| `simulation/graphics.py` | Rendering — minimaps, drone maps, UI panels, mission buttons |
+| `simulation/joystick_widget.py` | Manual flight control — dual-stick joystick panel |
 
-## Current State (V11.9)
+## Current State (V12.0)
 
 ### What Works
 - Entry sequence (fly to door, enter building, 360 deg scan on entry)
@@ -49,6 +51,11 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 - IED detection at actual IED position (not drone position)
 - Screenshots: per-drone mid (3 min) + per-drone done (no global sim screenshots)
 - UI: discovered map, per-drone maps, coverage stats, sync indicators
+- **Manual drone control** (click drone, press M, drag joystick sticks)
+- **Per-drone mission system** — MAP (default search) or DESTROY (fly to IED and detonate)
+- **IED destruction** — drones in DESTROY mode fly to known IED positions, eliminate them
+- **Wall collision reporting** — counts real impacts (>0.5 m/s), shown in per-drone status
+- **Unified single/multi UI** — per-drone status, map, and mission buttons always shown
 
 ## DESIGN PRINCIPLES
 
@@ -182,6 +189,51 @@ Per-drone (independent timers, start when drone LAUNCHES — first frame):
 - Max drone speed: 2.0 m/s, waypoint tolerance: 1.5m
 - Wall collision: 0.2m radius pushback from all wall segments
 - A* nav radius: 0.2m, grid resolution: 0.3m
+
+### Manual Drone Control
+- Click a drone on the main map to select it (1m hit radius, yellow ring)
+- Press **M** to toggle manual mode (joystick panel appears)
+- Left stick: forward/back + strafe. Right stick: yaw rotation
+- Drone cells are still marked as searched during manual flight (IED sensor stays active)
+- 6-min timer auto-releases manual mode for forced return
+- Only one drone in manual mode at a time. Selecting a new drone releases the old one.
+- **File:** `simulation/joystick_widget.py` (JoystickPanel), `simulation_gui.py` (_apply_manual_input_to_drone)
+
+### Per-Drone Mission System
+- Two missions: `"map"` (default autonomous search) and `"destroy"` (fly to IED, detonate)
+- Stored in `_drone_missions: Dict[int, str]` — default is `"map"` for every drone
+- UI: clickable `[MAP]` / `[DSTR]` button per drone in the Per-Drone Status panel
+- **Destroy behavior:**
+  1. On click [DSTR], `_find_known_ied(drone_id)` checks gossip features (multi-drone)
+     or minimap discovered_features (single-drone) for IED positions not yet destroyed
+  2. If IED is known, stores position in `_drone_destroying[drone_id]` and overrides
+     navigation target to fly there using A*
+  3. Each frame in DESTROY mode: if no target yet, re-checks map (gossip may have
+     delivered new IED data from another drone)
+  4. When drone arrives within 0.5m of IED: removes it from `environment.objects_of_interest`,
+     adds position to `_destroyed_ieds` set, reverts drone to MAP mission
+  5. Destroyed IEDs shown as red X circles on the main map
+  6. Objects Found panel shows "IED destroyed: N" in red when N > 0
+- **NEVER:** Remove IED from gossip/minimap — only from environment.objects_of_interest.
+  The sensor reads from that list, so removed IEDs won't be re-detected.
+
+### Wall Collision Reporting
+- `physics.update_drone()` returns blocked speed (float, m/s) — the speed at which
+  the drone was moving when the physics engine zeroed its velocity to prevent wall entry
+- Proximity pushback from `_handle_collisions()` is NOT counted (that's normal clearance)
+- A collision is counted only when blocked_speed > 0.5 m/s AND 2-second per-drone cooldown
+- In autonomous mode with LiDAR, collision count should be ~0 (A* avoids walls)
+- Manual flight into walls will increment the counter
+- Shown as `W:N` in per-drone status (orange if > 0, gray if 0)
+- Logged to console: `[COLLISION] D{i}: wall hit #{count} at (x,y) (speed m/s)`
+
+### Unified Single/Multi-Drone UI
+- Per-Drone Status section always renders (even with 1 drone)
+- `_build_single_drone_ui_data()` produces the same dict format as `_build_multi_drone_ui_data()`
+- Per-drone map always rendered via `_render_single_drone_map()` for 1 drone
+- Mission buttons `[MAP]`/`[DSTR]` and wall collision count `W:N` shown for all drones
+- WL Mesh Radio section shows "Single drone — no mesh active" for 1 drone,
+  link count for 2+ drones
 
 ## CRITICAL BUGS FOUND AND FIXED — DO NOT REINTRODUCE
 

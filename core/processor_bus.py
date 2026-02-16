@@ -82,6 +82,18 @@ class PositionBeacon:
     y: float
 
 
+# ── Pilot → H7: Manual control via 900 MHz RC link ──────────────────────
+
+@dataclass
+class ManualControlInput:
+    """Pilot → H7 via 900 MHz RC link. Joystick axes normalized [-1, +1]."""
+    manual_active: bool = False
+    left_stick_x: float = 0.0   # Roll: strafe left/right
+    left_stick_y: float = 0.0   # Pitch: forward/backward
+    right_stick_x: float = 0.0  # Yaw: rotate left/right
+    right_stick_y: float = 0.0  # Throttle/altitude (future 3D)
+
+
 # ── Simulation Bus (pass-through in sim, SPI/UART on hardware) ──────────
 
 class SimulationBus:
@@ -95,3 +107,4 @@ class SimulationBus:
         self.local_map_data: Optional[LocalMapData] = None
         self.remote_map_data: Optional[RemoteMapData] = None
         self.position_beacon: Optional[PositionBeacon] = None
+        self.manual_control: Optional[ManualControlInput] = None

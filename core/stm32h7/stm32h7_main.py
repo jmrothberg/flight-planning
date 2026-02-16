@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Tuple, Optional
 
 from core.stm32h7.drone import Drone, FlightController, PIDController
-from core.processor_bus import PositionUpdate, WaypointCommand, PositionBeacon
+from core.processor_bus import PositionUpdate, WaypointCommand, PositionBeacon, ManualControlInput
 
 
 # ── Hardware Abstraction Layer (HAL) ─────────────────────────────────────
@@ -121,6 +121,10 @@ class FlightControllerApp:
 
         # Incoming commands from N6 (via SPI)
         self._waypoint_cmd: Optional[WaypointCommand] = None
+
+        # Manual control state (from pilot via 900 MHz RC link)
+        self._manual_control = ManualControlInput()
+        self.manual_override_active = False
 
         # Outgoing data to other processors
         self._position_update = PositionUpdate(0, 0, 0, 0, 100.0)
@@ -216,6 +220,39 @@ class FlightControllerApp:
         )
         return self._position_beacon
 
+    # ── Manual Control (900 MHz RC link) ─────────────────────────────
+
+    def receive_manual_control(self, ctrl: ManualControlInput):
+        """Receive manual control input from pilot via 900 MHz RC link."""
+        self._manual_control = ctrl
+        self.manual_override_active = ctrl.manual_active
+
+    def send_manual_control(self) -> ManualControlInput:
+        """Return current manual control state."""
+        return self._manual_control
+
+    MAX_MANUAL_SPEED = 2.0     # m/s
+    MAX_ANGULAR_SPEED = 1.0    # rad/s
+
+    def _apply_manual_control(self, dt: float):
+        """Apply joystick axes to drone velocity in body frame.
+        Left stick: forward/backward + strafe. Right stick: yaw."""
+        ctrl = self._manual_control
+        ori = self.drone.orientation
+
+        # Body-frame velocity from left stick
+        fwd = ctrl.left_stick_y * self.MAX_MANUAL_SPEED   # +Y = forward
+        strafe = ctrl.left_stick_x * self.MAX_MANUAL_SPEED  # +X = right
+
+        # Rotate to world frame
+        vx = fwd * math.cos(ori) - strafe * math.sin(ori)
+        vy = fwd * math.sin(ori) + strafe * math.cos(ori)
+
+        self.drone.velocity[0] = vx
+        self.drone.velocity[1] = vy
+        self.drone.angular_velocity = ctrl.right_stick_x * self.MAX_ANGULAR_SPEED
+        self.drone.current_waypoint = None
+
     # ── Core Flight Logic ────────────────────────────────────────────
 
     def init(self):
@@ -271,14 +308,19 @@ class FlightControllerApp:
             self.drone.mission_complete = True
             return
 
-        # ── 4. Process waypoint command from N6 ─────────────────────
-        cmd = self.receive_waypoint()
-        if cmd is not None:
-            if cmd.is_emergency:
-                self.drone.emergency_stop()
-            else:
-                target = (cmd.target_x, cmd.target_y, cmd.target_z)
-                self.drone.navigate_to(target)
+        # ── 4. Manual control check (overrides N6 waypoints) ────────
+        if self.manual_override_active:
+            self._apply_manual_control(dt)
+            # Skip N6 waypoint processing — pilot has control
+        else:
+            # ── 4b. Process waypoint command from N6 ──────────────────
+            cmd = self.receive_waypoint()
+            if cmd is not None:
+                if cmd.is_emergency:
+                    self.drone.emergency_stop()
+                else:
+                    target = (cmd.target_x, cmd.target_y, cmd.target_z)
+                    self.drone.navigate_to(target)
 
         # ── 5. PID control + motor mixing ────────────────────────────
         if self.drone.current_waypoint is not None:

@@ -63,7 +63,9 @@ from core.stm32wl.stm32wl_main import MeshRadioApp
 # ── Inter-processor bus definitions ──────────────────────────────────────
 from core.processor_bus import (
     PositionUpdate, WaypointCommand, LocalMapData, RemoteMapData, PositionBeacon,
+    ManualControlInput,
 )
+from simulation.joystick_widget import JoystickPanel
 
 # ── Shared types (imported via processor packages) ───────────────────────
 from core.stm32n6.sensors import IEDSensor
@@ -243,6 +245,22 @@ class DroneSimulationGUI:
         # Sensor data storage
         self.lidar_data = None
 
+        # Manual drone control state
+        self._selected_drone_id: Optional[int] = None
+        self._manual_mode: Dict[int, bool] = {}
+        self._joystick_panel: Optional[JoystickPanel] = None
+
+        # Wall collision tracking (per drone ID -> count)
+        self._wall_collisions: Dict[int, int] = {}
+        self._wall_collision_cooldown: Dict[int, float] = {}  # drone -> last collision time
+
+        # Per-drone mission system
+        DRONE_MISSIONS = ["map", "destroy"]
+        self._drone_missions: Dict[int, str] = {}  # default "map" for all
+        self._destroyed_ieds: Set[Tuple[float, float]] = set()
+        self._drone_destroying: Dict[int, Tuple[float, float]] = {}  # drone -> IED pos it's flying to
+        self._mission_button_rects: list = []  # [(drone_id, pygame.Rect), ...]
+
     # ══════════════════════════════════════════════════════════════════
     # SEARCH ALGORITHM LOADING (dynamically loads core.search_* modules)
     # ══════════════════════════════════════════════════════════════════
@@ -384,6 +402,9 @@ class DroneSimulationGUI:
             # 6 min: force return
             if elapsed_i >= 360.0 and not self.drone_manager.returning_home[i]:
                 self.drone_manager.returning_home[i] = True
+                if self._manual_mode.get(i, False):
+                    self._release_manual(i)
+                    print(f"[6 MIN] D{i}: manual mode auto-released for return")
                 search_i = self.drone_manager.get_search(i)
                 cov = search_i.get_coverage_stats().get('coverage_pct', 0)
                 print(f"[6 MIN] Drone {i}: forcing return ({elapsed_i:.0f}s sim, {cov}% coverage)")
@@ -391,6 +412,8 @@ class DroneSimulationGUI:
             # 7 min: battery dead
             if elapsed_i >= 420.0:
                 if not drone_i.mission_complete:
+                    if self._manual_mode.get(i, False):
+                        self._release_manual(i)
                     drone_i.mission_complete = True
                     drone_i.emergency_stop()
                     search_i = self.drone_manager.get_search(i)
@@ -419,6 +442,27 @@ class DroneSimulationGUI:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+
+            # ── Mouse events: joystick panel + mission buttons + drone selection
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                mx, my = event.pos
+                # Joystick panel gets first priority
+                if self._joystick_panel and self._joystick_panel.handle_mouse_down(mx, my):
+                    pass  # captured by joystick
+                elif self._check_mission_button_click(mx, my):
+                    pass  # captured by mission button
+                else:
+                    self._try_select_drone(mx, my)
+
+            elif event.type == pygame.MOUSEMOTION:
+                if self._joystick_panel:
+                    mx, my = event.pos
+                    self._joystick_panel.handle_mouse_motion(mx, my)
+
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if self._joystick_panel:
+                    self._joystick_panel.handle_mouse_up()
+
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
@@ -465,6 +509,8 @@ class DroneSimulationGUI:
                     print(f"Comm range: {self.comm_range:.0f}m")
                     if self.drone_manager:
                         self.drone_manager.set_comm_range(self.comm_range)
+                elif event.key == pygame.K_m:
+                    self._toggle_manual_mode()
                 elif event.key in [pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
                                    pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8, pygame.K_9]:
                     idx = event.key - pygame.K_1
@@ -476,6 +522,181 @@ class DroneSimulationGUI:
                             print(f"Switched search to: {new_module}")
                         except Exception as e:
                             print(f"Failed to switch search: {e}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # MANUAL DRONE CONTROL
+    # ══════════════════════════════════════════════════════════════════
+
+    def _try_select_drone(self, screen_x: int, screen_y: int):
+        """Click on main map to select a drone (1m hit radius)."""
+        world_pos = self.graphics._screen_to_world((screen_x, screen_y))
+
+        if self.multi_drone_mode and self.drone_manager:
+            drone_list = [(i, self.drone_manager.drones[i])
+                          for i in range(self.drone_manager.count)]
+        else:
+            drone_list = [(0, self.drone)]
+
+        best_id = None
+        best_dist = float('inf')
+        for did, d in drone_list:
+            dx = world_pos[0] - d.position[0]
+            dy = world_pos[1] - d.position[1]
+            dist = math.hypot(dx, dy)
+            if dist < 1.0 and dist < best_dist:
+                best_dist = dist
+                best_id = did
+
+        if best_id is not None:
+            # If selecting a different drone while one is manual, release old one
+            if (self._selected_drone_id is not None and
+                    best_id != self._selected_drone_id and
+                    self._manual_mode.get(self._selected_drone_id, False)):
+                self._release_manual(self._selected_drone_id)
+            self._selected_drone_id = best_id
+            print(f"Selected drone D{best_id}")
+
+    def _toggle_manual_mode(self):
+        """M key: toggle manual control on selected drone."""
+        did = self._selected_drone_id
+        if did is None:
+            print("No drone selected — click a drone first, then press M")
+            return
+
+        currently_manual = self._manual_mode.get(did, False)
+        if currently_manual:
+            self._release_manual(did)
+        else:
+            # Release any other drone that's in manual mode
+            for other_id in list(self._manual_mode.keys()):
+                if self._manual_mode.get(other_id, False):
+                    self._release_manual(other_id)
+            self._manual_mode[did] = True
+            self._joystick_panel = JoystickPanel(
+                self.window_size[0] - 250 + 5,
+                self.window_size[1] - 140 - self.window_size[1] // 3)
+            print(f"MANUAL MODE ON — D{did} (drag sticks to fly, M to release)")
+
+    def _release_manual(self, drone_id: int):
+        """Release manual control on a drone — resume autonomous search."""
+        self._manual_mode[drone_id] = False
+        self._joystick_panel = None
+        self._selected_drone_id = None
+        # Stop drone velocity so it doesn't drift
+        if self.multi_drone_mode and self.drone_manager:
+            if drone_id < len(self.drone_manager.drones):
+                d = self.drone_manager.drones[drone_id]
+                d.velocity[0] = 0.0
+                d.velocity[1] = 0.0
+                d.angular_velocity = 0.0
+        else:
+            self.drone.velocity[0] = 0.0
+            self.drone.velocity[1] = 0.0
+            self.drone.angular_velocity = 0.0
+        print(f"MANUAL MODE OFF — D{drone_id} resuming autonomous")
+
+    def _check_mission_button_click(self, mx: int, my: int) -> bool:
+        """Check if click hit a mission button. Toggle mission on click."""
+        for drone_id, rect in self._mission_button_rects:
+            if rect.collidepoint(mx, my):
+                current = self._drone_missions.get(drone_id, "map")
+                new_mission = "destroy" if current == "map" else "map"
+                self._drone_missions[drone_id] = new_mission
+                print(f"D{drone_id} mission: {current.upper()} -> {new_mission.upper()}")
+                # If switching to destroy, immediately look for known IEDs
+                if new_mission == "destroy":
+                    ied_pos = self._find_known_ied(drone_id)
+                    if ied_pos:
+                        self._drone_destroying[drone_id] = ied_pos
+                        print(f"[DESTROY] D{drone_id}: targeting known IED at ({ied_pos[0]:.1f},{ied_pos[1]:.1f})")
+                    else:
+                        print(f"[DESTROY] D{drone_id}: no IED known yet, searching...")
+                else:
+                    # Switching back to map — cancel any destroy target
+                    if drone_id in self._drone_destroying:
+                        del self._drone_destroying[drone_id]
+                        print(f"D{drone_id}: destroy cancelled, resuming MAP")
+                return True
+        return False
+
+    def _find_known_ied(self, drone_id: int) -> Optional[Tuple[float, float]]:
+        """Find closest known IED position from drone's map/gossip data.
+        Returns None if no IED is known."""
+        known_ieds = []
+
+        if self.multi_drone_mode and self.drone_manager:
+            # Multi-drone: check gossip features for IEDs
+            gossip = self.drone_manager.gossip_maps[drone_id]
+            for f in gossip.get_features_by_type('ied'):
+                rounded = (round(f.position[0], 1), round(f.position[1], 1))
+                if rounded not in self._destroyed_ieds:
+                    known_ieds.append(f.position)
+        else:
+            # Single-drone: check minimap discovered features
+            from core.stm32n6.minimap import FeatureType
+            for f in self.minimap.discovered_features:
+                if f.feature_type == FeatureType.IED:
+                    rounded = (round(f.position[0], 1), round(f.position[1], 1))
+                    if rounded not in self._destroyed_ieds:
+                        known_ieds.append(f.position)
+
+        if not known_ieds:
+            return None
+
+        # Return closest IED to the drone
+        if self.multi_drone_mode and self.drone_manager:
+            drone = self.drone_manager.drones[drone_id]
+        else:
+            drone = self.drone
+        dx = float(drone.position[0])
+        dy = float(drone.position[1])
+        best = min(known_ieds, key=lambda p: math.hypot(p[0] - dx, p[1] - dy))
+        return best
+
+    def _apply_manual_input_to_drone(self, drone, search_algo):
+        """Read joystick axes and apply velocity to drone in body frame.
+        Also marks current cell + cardinal neighbors as searched (IED sensor still on)."""
+        if not self._joystick_panel:
+            return
+        lx, ly, rx, ry = self._joystick_panel.get_axes()
+        ori = drone.orientation
+        max_speed = 2.0
+        max_yaw = 1.0
+
+        fwd = ly * max_speed
+        strafe = lx * max_speed
+        vx = fwd * math.cos(ori) - strafe * math.sin(ori)
+        vy = fwd * math.sin(ori) + strafe * math.cos(ori)
+
+        # Wall collision: check if the next position would cross a wall.
+        # physics.update_drone only checks the destination, not the path,
+        # so the drone can tunnel through thin walls at speed.
+        px, py = float(drone.position[0]), float(drone.position[1])
+        lookahead = 0.15  # seconds lookahead (~3 frames at 60fps)
+        next_x = px + vx * lookahead
+        next_y = py + vy * lookahead
+        if not self.environment.is_path_clear((px, py), (next_x, next_y), radius=0.2):
+            vx = 0.0
+            vy = 0.0
+
+        drone.velocity[0] = vx
+        drone.velocity[1] = vy
+        drone.angular_velocity = rx * max_yaw
+        drone.current_waypoint = None
+
+        # Mark cells as searched (IED detector still scanning during manual flight)
+        # Mirrors the cell-marking logic in get_next_waypoint() of the search algorithm
+        if hasattr(search_algo, '_to_grid') and hasattr(search_algo, 'searched_cells'):
+            px, py = float(drone.position[0]), float(drone.position[1])
+            curr_cell = search_algo._to_grid(px, py)
+            if curr_cell in search_algo.free_cells:
+                search_algo.searched_cells.add(curr_cell)
+            for ddx, ddy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                neighbor = (curr_cell[0] + ddx, curr_cell[1] + ddy)
+                if (neighbor in search_algo.free_cells and
+                        neighbor not in search_algo.wall_cells and
+                        curr_cell not in search_algo.wall_cells):
+                    search_algo.searched_cells.add(neighbor)
 
     # ══════════════════════════════════════════════════════════════════
     # SYSTEM UPDATES
@@ -496,7 +717,18 @@ class DroneSimulationGUI:
 
         # ── H7: Flight controller update ─────────────────────────────
         self.drone.update(dt)
-        self.physics.update_drone(self.drone, dt)
+        blocked_speed = self.physics.update_drone(self.drone, dt)
+        # Only count as collision if drone had real speed (>0.5 m/s) and
+        # at least 2s since last collision for this drone (avoid counting
+        # the same wall encounter many times).
+        if blocked_speed > 0.5:
+            now_col = time.time()
+            if now_col - self._wall_collision_cooldown.get(0, 0) > 2.0:
+                self._wall_collision_cooldown[0] = now_col
+                self._wall_collisions[0] = self._wall_collisions.get(0, 0) + 1
+                count = self._wall_collisions[0]
+                x, y = float(self.drone.position[0]), float(self.drone.position[1])
+                print(f"[COLLISION] D0: wall hit #{count} at ({x:.1f},{y:.1f}) ({blocked_speed:.1f} m/s)")
 
         # ── H7: Breadcrumb recording ────────────────────────────────
         if (time.time() - self._last_breadcrumb_ts) >= 0.2:
@@ -564,6 +796,46 @@ class DroneSimulationGUI:
                 message_type="ied_alert", timestamp=time.time(),
                 data={"text": text}))
             self.graphics.notify_radio_sent()
+
+        # ── Destroy mission: look for known IEDs or check arrival ──
+        if self._drone_missions.get(0, "map") == "destroy" and 0 not in self._drone_destroying:
+            # Not targeting an IED yet — check map for known ones
+            ied_pos = self._find_known_ied(0)
+            if ied_pos:
+                self._drone_destroying[0] = ied_pos
+                print(f"[DESTROY] D0: targeting known IED at ({ied_pos[0]:.1f},{ied_pos[1]:.1f})")
+            # else: keep searching normally, will check again next frame
+
+        if 0 in self._drone_destroying:
+            ied_target = self._drone_destroying[0]
+            dist_to_ied = math.hypot(
+                float(self.drone.position[0]) - ied_target[0],
+                float(self.drone.position[1]) - ied_target[1])
+            if dist_to_ied < 0.5:
+                print(f"[DESTROY] D0: IED destroyed at ({ied_target[0]:.1f},{ied_target[1]:.1f})")
+                rounded_pos = (round(ied_target[0], 1), round(ied_target[1], 1))
+                self._destroyed_ieds.add(rounded_pos)
+                self.environment.objects_of_interest = [
+                    obj for obj in self.environment.objects_of_interest
+                    if not (obj[2] == 'ied' and
+                            abs(obj[0] - ied_target[0]) < 0.5 and
+                            abs(obj[1] - ied_target[1]) < 0.5)]
+                del self._drone_destroying[0]
+                self._drone_missions[0] = "map"
+                print(f"[DESTROY] D0: IED eliminated, resuming MAP mission")
+
+        # ── Manual control bypass: pilot flies directly ────────────
+        if self._manual_mode.get(0, False):
+            self._apply_manual_input_to_drone(self.drone, self.search_algorithm)
+            # IED sensor still runs during manual flight
+            ied_reading = self.ied_sensor.read(
+                (float(self.drone.position[0]), float(self.drone.position[1])), self.environment)
+            if ied_reading and ied_reading.confidence > 0.2:
+                text = ied_reading.to_text()
+                print(f"IED ALERT: {text}")
+                ied_pos = ied_reading.ied_position or (float(self.drone.position[0]), float(self.drone.position[1]))
+                self.minimap.add_ied_detection(ied_pos, ied_reading.confidence)
+            return  # Skip autonomous navigation
 
         # ── N6→H7: Navigation — entry sequence or search ────────────
         next_target_2d = None
@@ -648,6 +920,10 @@ class DroneSimulationGUI:
                 print("Press SPACE to start new mission, R to reset, ESC to exit")
                 return
             next_target_2d = self.slam.entry_point
+
+        # ── Destroy mission: override target to fly to IED ──────────
+        if 0 in self._drone_destroying:
+            next_target_2d = self._drone_destroying[0]
 
         # ── H7: Execute navigation (A* pathfinding + stuck escape) ───
         if next_target_2d and next_target_2d != "handled":
@@ -782,7 +1058,15 @@ class DroneSimulationGUI:
 
             # ── H7: Physics update ───────────────────────────────────
             drone.update(dt)
-            self.physics.update_drone(drone, dt)
+            blocked_speed = self.physics.update_drone(drone, dt)
+            if blocked_speed > 0.5:
+                now_col = time.time()
+                if now_col - self._wall_collision_cooldown.get(i, 0) > 2.0:
+                    self._wall_collision_cooldown[i] = now_col
+                    self._wall_collisions[i] = self._wall_collisions.get(i, 0) + 1
+                    count = self._wall_collisions[i]
+                    cx, cy = float(drone.position[0]), float(drone.position[1])
+                    print(f"[COLLISION] D{i}: wall hit #{count} at ({cx:.1f},{cy:.1f}) ({blocked_speed:.1f} m/s)")
 
             # ── Entry sequence (H7 navigation + N6 SLAM) ────────────
             if not self.drone_manager.inside_building[i]:
@@ -879,6 +1163,18 @@ class DroneSimulationGUI:
             claimed = self.drone_manager.get_claimed_by_others(i)
             search.set_claimed_by_others(claimed)
 
+            # ── Manual control bypass for this drone ──────────────────
+            if self._manual_mode.get(i, False):
+                self._apply_manual_input_to_drone(drone, search)
+                # IED sensor still runs
+                ied_reading = self.ied_sensor.read(
+                    (float(drone.position[0]), float(drone.position[1])), self.environment)
+                if ied_reading and ied_reading.confidence > 0.2:
+                    print(f"Drone {i} IED ALERT: {ied_reading.to_text()}")
+                    ied_pos = ied_reading.ied_position or tuple(drone.position[:2])
+                    gossip.add_local_feature("ied", ied_pos, ied_reading.confidence)
+                continue  # Skip autonomous navigation for this drone
+
             # ── N6: Search algorithm decision ────────────────────────
             start_time = self.drone_manager.mission_start_times[i]
             if start_time:
@@ -951,6 +1247,10 @@ class DroneSimulationGUI:
                 if target is None and lidar_data:
                     target = self._lidar_fallback_target(drone.position, drone.orientation, lidar_data)
 
+            # ── Destroy mission: override target to fly to IED ───────
+            if i in self._drone_destroying:
+                target = self._drone_destroying[i]
+
             # ── H7: Execute navigation ───────────────────────────────
             if target:
                 escaped = (self.drone_manager.inside_building[i] and
@@ -991,6 +1291,35 @@ class DroneSimulationGUI:
                 print(f"Drone {i} IED ALERT: {ied_reading.to_text()}")
                 ied_pos = ied_reading.ied_position or tuple(drone.position[:2])
                 gossip.add_local_feature("ied", ied_pos, ied_reading.confidence)
+
+            # ── Destroy mission: look for known IEDs or check arrival ─
+            if self._drone_missions.get(i, "map") == "destroy" and i not in self._drone_destroying:
+                # Not targeting yet — search gossip map for known IEDs
+                ied_pos = self._find_known_ied(i)
+                if ied_pos:
+                    self._drone_destroying[i] = ied_pos
+                    print(f"[DESTROY] D{i}: targeting known IED at ({ied_pos[0]:.1f},{ied_pos[1]:.1f})")
+                # else: keep searching normally, will check again next frame
+
+            if i in self._drone_destroying:
+                ied_target = self._drone_destroying[i]
+                dist_to_ied = math.hypot(
+                    float(drone.position[0]) - ied_target[0],
+                    float(drone.position[1]) - ied_target[1])
+                if dist_to_ied < 0.5:
+                    print(f"[DESTROY] D{i}: IED destroyed at ({ied_target[0]:.1f},{ied_target[1]:.1f})")
+                    rounded_pos = (round(ied_target[0], 1), round(ied_target[1], 1))
+                    self._destroyed_ieds.add(rounded_pos)
+                    # Remove IED from environment objects
+                    self.environment.objects_of_interest = [
+                        obj for obj in self.environment.objects_of_interest
+                        if not (obj[2] == 'ied' and
+                                abs(obj[0] - ied_target[0]) < 0.5 and
+                                abs(obj[1] - ied_target[1]) < 0.5)]
+                    del self._drone_destroying[i]
+                    # Revert to map mission
+                    self._drone_missions[i] = "map"
+                    print(f"[DESTROY] D{i}: IED eliminated, resuming MAP mission")
 
     # ══════════════════════════════════════════════════════════════════
     # NAVIGATION HELPERS
@@ -1248,6 +1577,17 @@ class DroneSimulationGUI:
         self.graphics.clear()
         self.graphics.draw_environment(self.environment)
 
+        # Destroyed IED markers (crossed-out red circles)
+        for died_pos in self._destroyed_ieds:
+            center = self.graphics._world_to_screen(died_pos)
+            pygame.draw.circle(self.graphics.screen, (255, 0, 0), center, 8, 2)
+            pygame.draw.line(self.graphics.screen, (255, 0, 0),
+                             (center[0] - 6, center[1] - 6),
+                             (center[0] + 6, center[1] + 6), 2)
+            pygame.draw.line(self.graphics.screen, (255, 0, 0),
+                             (center[0] + 6, center[1] - 6),
+                             (center[0] - 6, center[1] + 6), 2)
+
         # Laser target on door
         if not self._inside_building:
             laser_screen_pos = self.graphics._world_to_screen(self._laser_target)
@@ -1288,6 +1628,14 @@ class DroneSimulationGUI:
 
             ied_range_px = int(2.0 * self.graphics.scale)
             pygame.draw.circle(self.graphics.screen, color, center, ied_range_px, 1)
+
+            # Selection highlight (yellow ring)
+            if i == self._selected_drone_id:
+                sel_radius = drone_radius + 6
+                pygame.draw.circle(self.graphics.screen, (255, 255, 0), center, sel_radius, 2)
+                mode_text = "MANUAL" if self._manual_mode.get(i, False) else "SELECTED"
+                mode_surf = font_drone.render(mode_text, True, (255, 255, 0))
+                self.graphics.screen.blit(mode_surf, (center[0] + drone_radius + 8, center[1] - 6))
 
         # SLAM map
         if self._show_map:
@@ -1343,9 +1691,11 @@ class DroneSimulationGUI:
 
         self.graphics.draw_minimap(minimap_data, self.drone.position[:2])
 
-        # Per-drone maps
+        # Per-drone maps (always shown)
         if self.multi_drone_mode and self.drone_manager:
             self._render_drone_maps(minimap_data)
+        else:
+            self._render_single_drone_map(minimap_data)
 
         # Search debug info
         search_debug = {}
@@ -1371,21 +1721,34 @@ class DroneSimulationGUI:
                 if obj_type:
                     object_counts[obj_type] = object_counts.get(obj_type, 0) + 1
         search_debug['objects_found'] = [f"{t}: {n}" for t, n in sorted(object_counts.items())]
+        search_debug['ieds_destroyed'] = len(self._destroyed_ieds)
 
-        # Multi-drone UI data
-        multi_drone_data = None
+        # Per-drone UI data (always built — single or multi)
         if self.multi_drone_mode and self.drone_manager:
             multi_drone_data = self._build_multi_drone_ui_data()
+        else:
+            multi_drone_data = self._build_single_drone_ui_data()
 
         simulated_elapsed = (time.time() - self._start_time) * SIM_SPEED if self._start_time else None
-        self.graphics.draw_ui(
+        self._mission_button_rects = self.graphics.draw_ui(
             self.drone, self.slam, self.comm, simulated_elapsed,
-            self.current_search_name, self.search_options, search_debug, multi_drone_data)
+            self.current_search_name, self.search_options, search_debug, multi_drone_data,
+            selected_drone=self._selected_drone_id, manual_mode=self._manual_mode) or []
 
         self.graphics.draw_search_debug(search_debug, self.drone.position[:2])
 
         if self.multi_drone_mode and self.drone_manager:
             self._render_multi_drone_overlay()
+
+        # Joystick panel (manual mode)
+        if self._joystick_panel and any(self._manual_mode.values()):
+            did = self._selected_drone_id
+            if did is not None and self._manual_mode.get(did, False):
+                font_manual = pygame.font.Font(None, 20)
+                label = font_manual.render(f"MANUAL: D{did}", True, (255, 255, 0))
+                self.graphics.screen.blit(label,
+                    (self._joystick_panel.x + 5, self._joystick_panel.y - 18))
+            self._joystick_panel.draw(self.graphics.screen)
 
         self.graphics.present()
 
@@ -1469,6 +1832,30 @@ class DroneSimulationGUI:
         minimap_data["objects"] = all_features_objects
         minimap_data["ieds"] = all_features_ieds
 
+    def _render_single_drone_map(self, minimap_data):
+        """Render per-drone map for the single-drone case.
+
+        Produces the same data format that ``draw_drone_maps`` expects."""
+        if not hasattr(self.search_algorithm, 'get_grid_data'):
+            return
+        color = (255, 80, 80)
+        search = self.search_algorithm
+        drone_maps_data = [{
+            'drone_id': 0,
+            'free_cells': search.free_cells.copy(),
+            'searched_cells': search.searched_cells.copy(),
+            'wall_cells': search.wall_cells.copy(),
+            'searched_by_drone': {0: search.searched_cells.copy()},
+            'drone_colors': {0: color},
+            'color': color,
+            'position': self.drone.position[:2],
+            'features': [],
+            'coverage_pct': search.get_coverage_stats()['coverage_pct'],
+        }]
+        world_bounds = minimap_data.get("world_bounds", (-5, -5, 55, 45)) if minimap_data else (-5, -5, 55, 45)
+        wall_segments = minimap_data.get("wall_segments", []) if minimap_data else []
+        self.graphics.draw_drone_maps(drone_maps_data, world_bounds, wall_segments)
+
     def _render_drone_maps(self, minimap_data):
         """Render per-drone individual maps."""
         drone_maps_data = []
@@ -1543,6 +1930,8 @@ class DroneSimulationGUI:
                 'status': status_str,
                 'coverage_pct': search_i.get_coverage_stats()['coverage_pct'],
                 'sync_ok': sync_ok, 'merged_cells': merged,
+                'wall_hits': self._wall_collisions.get(i, 0),
+                'mission': self._drone_missions.get(i, 'map'),
             })
 
         gossip_links = self.drone_manager.get_gossip_links()
@@ -1551,6 +1940,34 @@ class DroneSimulationGUI:
             'drones': drones_info,
             'mesh_links': len(gossip_links),
             'global_coverage': stats['coverage_pct'],
+            'comm_range': self.comm_range,
+        }
+
+    def _build_single_drone_ui_data(self) -> dict:
+        """Build per-drone status data for the single-drone case.
+
+        Returns the same dict format as ``_build_multi_drone_ui_data`` so the
+        Per-Drone Status section in graphics renders identically."""
+        elapsed = (time.time() - self._start_time) * SIM_SPEED if self._start_time else 0
+        complete = self.drone.mission_complete
+        returning = self._returning_home
+        inside = self._inside_building
+        status_str = "DONE" if complete else "RTN" if returning else "SRCH" if inside else "ENTRY"
+        cov = 0
+        if hasattr(self.search_algorithm, 'get_coverage_stats'):
+            cov = self.search_algorithm.get_coverage_stats().get('coverage_pct', 0)
+        drones_info = [{
+            'id': 0, 'color': (255, 80, 80),
+            'battery': self.drone.battery_level, 'elapsed': elapsed,
+            'status': status_str, 'coverage_pct': cov,
+            'sync_ok': False, 'merged_cells': 0,
+            'wall_hits': self._wall_collisions.get(0, 0),
+            'mission': self._drone_missions.get(0, 'map'),
+        }]
+        return {
+            'drones': drones_info,
+            'mesh_links': 0,
+            'global_coverage': cov,
             'comm_range': self.comm_range,
         }
 
@@ -1843,6 +2260,15 @@ class DroneSimulationGUI:
         self._drone_completion_elapsed.clear()
         self._pending_drone_screenshots.clear()
         self._coverage_milestones_logged.clear()
+        self._selected_drone_id = None
+        self._manual_mode.clear()
+        self._joystick_panel = None
+        self._wall_collisions.clear()
+        self._wall_collision_cooldown.clear()
+        self._drone_missions.clear()
+        self._destroyed_ieds.clear()
+        self._drone_destroying.clear()
+        self._mission_button_rects.clear()
 
         if self.multi_drone_mode and self.drone_manager:
             self.drone_manager.reset(entry_point=(self._door_x, -3.0))
