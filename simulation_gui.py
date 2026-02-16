@@ -1355,12 +1355,22 @@ class DroneSimulationGUI:
         except Exception:
             pass
 
-        objects_found = []
-        for feature in self.minimap.discovered_features:
-            obj_type = feature.additional_data.get('detection_type', '') if feature.additional_data else ''
-            if obj_type and obj_type not in objects_found:
-                objects_found.append(obj_type)
-        search_debug['objects_found'] = objects_found
+        # Collect objects found from all drones' gossip maps (with counts)
+        object_counts = {}  # type -> count
+        if self.multi_drone_mode and self.drone_manager:
+            seen = set()
+            for i in range(self.drone_manager.count):
+                for f in self.drone_manager.gossip_maps[i].features:
+                    key = (f.feature_type, round(f.position[0], 1), round(f.position[1], 1))
+                    if key not in seen:
+                        seen.add(key)
+                        object_counts[f.feature_type] = object_counts.get(f.feature_type, 0) + 1
+        else:
+            for feature in self.minimap.discovered_features:
+                obj_type = feature.additional_data.get('detection_type', '') if feature.additional_data else ''
+                if obj_type:
+                    object_counts[obj_type] = object_counts.get(obj_type, 0) + 1
+        search_debug['objects_found'] = [f"{t}: {n}" for t, n in sorted(object_counts.items())]
 
         # Multi-drone UI data
         multi_drone_data = None
@@ -1436,6 +1446,28 @@ class DroneSimulationGUI:
         minimap_data["drone_positions"] = [
             (self.drone_manager.drones[i].position[:2], self.drone_manager.get_color(i))
             for i in range(self.drone_manager.count)]
+
+        # Collect features (objects/IEDs) from all drones' gossip maps
+        # for the combined Discovered Map, colored by discovering drone
+        all_features_objects = []
+        all_features_ieds = []
+        seen_positions = set()  # deduplicate by position
+        for i in range(self.drone_manager.count):
+            gossip = self.drone_manager.gossip_maps[i]
+            drone_color = self.drone_manager.get_color(i)
+            for feature in gossip.features:
+                # Deduplicate: skip if same type+position already added
+                key = (feature.feature_type, round(feature.position[0], 1), round(feature.position[1], 1))
+                if key in seen_positions:
+                    continue
+                seen_positions.add(key)
+                discoverer_color = minimap_data["drone_colors"].get(feature.drone_id, drone_color)
+                if feature.feature_type == 'ied':
+                    all_features_ieds.append((feature.position, feature.confidence, 'IED', discoverer_color))
+                else:
+                    all_features_objects.append((feature.position, feature.confidence, feature.feature_type, discoverer_color))
+        minimap_data["objects"] = all_features_objects
+        minimap_data["ieds"] = all_features_ieds
 
     def _render_drone_maps(self, minimap_data):
         """Render per-drone individual maps."""

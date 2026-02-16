@@ -57,6 +57,7 @@ class GraphicsEngine:
             raise
         
         # Fonts
+        self.font_tiny = pygame.font.Font(None, 13)   # Map feature labels (thin, readable)
         self.font_small = pygame.font.Font(None, 16)
         self.font_medium = pygame.font.Font(None, 24)
         self.font_large = pygame.font.Font(None, 32)
@@ -575,24 +576,26 @@ class GraphicsEngine:
                 dp = world_to_panel(dx, dy)
                 pygame.draw.rect(self.screen, Colors.GREEN, (dp[0] - 2, dp[1] - 2, 4, 4))
 
-        # 5. Features (IEDs red + label, objects blue + label)
+        # 5. Features (IEDs + objects, colored by discovering drone)
         if features:
             for f in features:
                 fpos = world_to_panel(f['position'][0], f['position'][1])
                 if not (panel_x < fpos[0] < panel_x + panel_width and
                         panel_y < fpos[1] < panel_y + panel_height):
                     continue
+                # Use discovering drone's color for the marker, black for text
+                drone_color = f.get('drone_color', Colors.RED if f['type'] == 'ied' else Colors.BLUE)
                 if f['type'] == 'ied':
                     pygame.draw.circle(self.screen, Colors.RED, fpos, 4)
                     pygame.draw.circle(self.screen, Colors.WHITE, fpos, 4, 1)
-                    lbl = self.font_small.render("IED!", True, Colors.RED)
-                    self.screen.blit(lbl, (fpos[0] + 5, fpos[1] - 6))
+                    lbl = self.font_tiny.render("IED!", True, Colors.BLACK)
+                    self.screen.blit(lbl, (fpos[0] + 5, fpos[1] - 5))
                 else:
-                    pygame.draw.circle(self.screen, Colors.BLUE, fpos, 3)
+                    pygame.draw.circle(self.screen, drone_color, fpos, 3)
                     label = f.get('label', '')
                     if label:
-                        lbl = self.font_small.render(label[:6], True, Colors.BLUE)
-                        self.screen.blit(lbl, (fpos[0] + 4, fpos[1] - 6))
+                        lbl = self.font_tiny.render(label[:8], True, Colors.BLACK)
+                        self.screen.blit(lbl, (fpos[0] + 4, fpos[1] - 5))
 
         # 6. Breadcrumbs (light green dots)
         if breadcrumbs:
@@ -657,15 +660,17 @@ class GraphicsEngine:
             if frontier_list:
                 frontiers_by_drone = {0: frontier_list}
 
-        # --- Features ---
+        # --- Features (objects + IEDs, with drone color if available) ---
         features = []
         for obj_data in minimap_data.get("objects", []):
             if isinstance(obj_data, tuple) and len(obj_data) >= 2:
                 label = obj_data[2] if len(obj_data) > 2 else ""
-                features.append({'type': 'object', 'position': obj_data[0], 'label': label})
+                drone_color = obj_data[3] if len(obj_data) > 3 else Colors.BLUE
+                features.append({'type': 'object', 'position': obj_data[0], 'label': label, 'drone_color': drone_color})
         for ied_data in minimap_data.get("ieds", []):
             if isinstance(ied_data, tuple) and len(ied_data) >= 2:
-                features.append({'type': 'ied', 'position': ied_data[0], 'label': 'IED!'})
+                drone_color = ied_data[3] if len(ied_data) > 3 else Colors.RED
+                features.append({'type': 'ied', 'position': ied_data[0], 'label': 'IED!', 'drone_color': drone_color})
 
         # --- Drone positions ---
         dp_list = minimap_data.get("drone_positions", None)
@@ -770,10 +775,13 @@ class GraphicsEngine:
             for feature in drone_data.get('features', []):
                 if hasattr(feature, 'position'):
                     ftype = feature.feature_type if hasattr(feature, 'feature_type') else ''
+                    # Color by discovering drone
+                    fcolor = drone_colors.get(feature.drone_id, color) if hasattr(feature, 'drone_id') else color
                     features.append({
                         'type': 'ied' if ftype == 'ied' else 'object',
                         'position': feature.position,
-                        'label': ftype[:6] if ftype != 'ied' else 'IED!',
+                        'label': ftype[:8] if ftype != 'ied' else 'IED!',
+                        'drone_color': fcolor,
                     })
 
             # --- Drone position ---
