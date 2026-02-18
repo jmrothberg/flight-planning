@@ -35,7 +35,7 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 | `simulation/graphics.py` | Rendering — minimaps, drone maps, UI panels, mission buttons |
 | `simulation/joystick_widget.py` | Manual flight control — dual-stick joystick panel |
 
-## Current State (V12.0)
+## Current State (V12.2)
 
 ### What Works
 - Entry sequence (fly to door, enter building, 360 deg scan on entry)
@@ -56,6 +56,10 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 - **IED destruction** — drones in DESTROY mode fly to known IED positions, eliminate them
 - **Wall collision reporting** — counts real impacts (>0.5 m/s), shown in per-drone status
 - **Unified single/multi UI** — per-drone status, map, and mission buttons always shown
+- **Base station (radio-only)** — Discovered Map shows only what was radioed back
+- **Radio-filtered walls** — base station walls are LiDAR segments filtered to radio-known areas
+- **Objects Found from radio** — UI panel reads from base station gossip, not direct drone data
+- **Base station data preserved** — adding/removing drones doesn't wipe the discovered map
 
 ## DESIGN PRINCIPLES
 
@@ -173,10 +177,37 @@ Per-drone (independent timers, start when drone LAUNCHES — first frame):
 - CRITICAL: Never use building layout knowledge for search decisions.
   Drones must navigate using ONLY what they discover via LiDAR.
 
+### Base Station (Ground Controller)
+- Fixed position at drone launch point (entry_point, typically `(_door_x, -3)`)
+- Has its own GossipMap + MeshProtocol + MeshNode in DroneManager
+- Participates in gossip exchange: drones in comm range sync directly with base station
+- Drone positions propagate through gossip (`known_positions` dict in GossipMap)
+- The "Discovered Map" reads ONLY from the base station's gossip — not from search
+  algorithms. This means it shows only what was physically radioed to the operator.
+- If a drone is out of comm range and no relay exists, base station has no data from it
+- Single-drone mode: lightweight base station gossip syncs when drone is in range
+- `BASE_STATION_ID = -1` constant in `drone_manager.py`
+- **Wall segments**: LiDAR segments are FILTERED to only show walls in areas the base
+  station has received gossip data about. Uses expanded cell neighborhood check:
+  precompute `known_area` from gossip cells ± 1, then include only segments whose
+  midpoint grid cell is in `known_area`. This gives LiDAR-quality wall rendering
+  without showing walls the radio hasn't delivered yet.
+- **Objects Found panel**: reads from base station gossip features, not drone-local data.
+  Only objects that were radioed to the base station appear in the UI.
+- **Data preservation**: when adding/removing drones (pressing D), the base station's
+  accumulated gossip data is saved and merged into the new DroneManager's base station.
+  Uses `get_sync_payload()` → change sender_id → `merge_remote_update()`.
+- NEVER use search algorithm data for the Discovered Map — that would be cheating.
+  The operator can only see what the radio delivered.
+- NEVER use minimap wall_segments directly — they are drone-local LiDAR data.
+  Always filter through the base station's known cell set.
+
 ### Global Coverage Calculation
 - Uses search algorithm data directly (`search.searched_cells`, `search.free_cells`)
 - Does NOT use gossip maps (which are incomplete when drones are out of comm range)
 - Formula: `interior_free & all_searched` / `interior_free` (intersection, matching per-drone formula)
+- NOTE: Global coverage is a debug/analysis metric, not what the operator sees.
+  The operator's view (Discovered Map) comes from the base station gossip.
 
 ### Return Home (Multi-Drone)
 - First tries A* path to home (entry_point at y=-3)

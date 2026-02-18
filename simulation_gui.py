@@ -142,6 +142,9 @@ class DroneSimulationGUI:
         self.running = True
         self.clock = pygame.time.Clock()
 
+        # Ensure Mission_Data folder exists
+        os.makedirs("Mission_Data", exist_ok=True)
+
         # ══════════════════════════════════════════════════════════════
         # SIMULATED WORLD (environment, physics, objects, IEDs)
         # On real hardware: this is the actual physical world
@@ -260,6 +263,10 @@ class DroneSimulationGUI:
         self._destroyed_ieds: Set[Tuple[float, float]] = set()
         self._drone_destroying: Dict[int, Tuple[float, float]] = {}  # drone -> IED pos it's flying to
         self._mission_button_rects: list = []  # [(drone_id, pygame.Rect), ...]
+
+        # Base station for single-drone mode (multi uses DroneManager's base station)
+        from core.stm32wl.gossip_map import GossipMap as _GossipMap
+        self._single_base_station_gossip = _GossipMap(drone_id=-1)
 
     # ══════════════════════════════════════════════════════════════════
     # SEARCH ALGORITHM LOADING (dynamically loads core.search_* modules)
@@ -969,6 +976,35 @@ class DroneSimulationGUI:
                     self._finalize_video()
                     print("Press SPACE to start new mission, R to reset, ESC to exit")
 
+        # ── WL: Base station sync (radio only) ─────────────────────
+        # Base station at launch point receives data if drone is in comm range
+        drone_pos = (float(self.drone.position[0]), float(self.drone.position[1]))
+        base_pos = (self._door_x, -3.0)
+        dist_to_base = math.hypot(drone_pos[0] - base_pos[0], drone_pos[1] - base_pos[1])
+        if dist_to_base <= self.comm_range:
+            # Build a gossip-like payload from local search data
+            bs = self._single_base_station_gossip
+            s = self.search_algorithm
+            bs.add_local_searched(set())  # ensure drone_id bucket exists
+            # Direct merge: copy search data to a temporary gossip and sync
+            from core.stm32wl.gossip_map import GossipMap as _GM
+            tmp = _GM(drone_id=0)
+            tmp.add_local_searched(s.searched_cells.copy())
+            tmp.add_local_free(s.free_cells.copy())
+            tmp.add_local_walls(s.wall_cells.copy())
+            tmp.update_position(0, drone_pos)
+            # Copy only IED and camera-detected features (skip walls/doors/obstacles)
+            from core.stm32n6.minimap import FeatureType
+            for f in self.minimap.discovered_features:
+                if f.feature_type == FeatureType.IED:
+                    tmp.add_local_feature('ied', f.position, f.confidence)
+                elif f.feature_type == FeatureType.OBJECT and f.additional_data:
+                    det_type = f.additional_data.get('detection_type', '')
+                    if det_type:
+                        tmp.add_local_feature(det_type, f.position, f.confidence)
+            payload = tmp.get_sync_payload()
+            bs.merge_remote_update(payload, force=True)
+
         # ── WL: Communication (radio map updates) ────────────────────
         if detected_objects:
             self.comm.send_priority_data(detected_objects, self.drone.position[:2])
@@ -1531,12 +1567,26 @@ class DroneSimulationGUI:
                         'start_time': self.search_algorithm.start_time,
                     })
 
+            # Preserve existing base station data before recreating DroneManager
+            old_bs_payload = None
+            if preserve_drone_0:
+                if self.drone_manager and self.drone_manager.base_station_gossip:
+                    old_bs_payload = self.drone_manager.base_station_gossip.get_sync_payload()
+                elif self._single_base_station_gossip:
+                    old_bs_payload = self._single_base_station_gossip.get_sync_payload()
+
             self.multi_drone_mode = True
             self.drone_manager = DroneManager(
                 count=self.drone_count, comm_range=self.comm_range,
                 building_width=self.environment.width,
                 building_height=self.environment.height)
             self.drone_manager.initialize(entry_point=(self._door_x, -3.0))
+
+            # Restore base station data into the new DroneManager's base station
+            if old_bs_payload and self.drone_manager.base_station_gossip:
+                old_bs_payload["sender_id"] = 999  # avoid self-rejection
+                self.drone_manager.base_station_gossip.merge_remote_update(
+                    old_bs_payload, force=True)
 
             for i, state in enumerate(existing_states):
                 if i < len(self.drone_manager.drones):
@@ -1576,6 +1626,29 @@ class DroneSimulationGUI:
     def _render(self):
         self.graphics.clear()
         self.graphics.draw_environment(self.environment)
+
+        # Base station icon (single-drone mode — multi-drone draws in overlay)
+        if not (self.multi_drone_mode and self.drone_manager):
+            bs_pos = (self._door_x, -3.0)
+            bs_screen = self.graphics._world_to_screen(bs_pos)
+            sz = 8
+            tri = [(bs_screen[0], bs_screen[1] - sz),
+                   (bs_screen[0] - sz, bs_screen[1] + sz),
+                   (bs_screen[0] + sz, bs_screen[1] + sz)]
+            pygame.draw.polygon(self.graphics.screen, (255, 255, 255), tri)
+            pygame.draw.polygon(self.graphics.screen, (0, 0, 0), tri, 2)
+            font_bs = pygame.font.SysFont('Arial', 11)
+            lbl = font_bs.render("BASE", True, (255, 255, 255))
+            self.graphics.screen.blit(lbl, (bs_screen[0] - 14, bs_screen[1] + sz + 2))
+            # Comm range circle
+            radius = int(self.comm_range * self.graphics.scale)
+            pygame.draw.circle(self.graphics.screen, (200, 200, 200), bs_screen, radius, 1)
+            # Radio link to drone if in range
+            drone_pos = (float(self.drone.position[0]), float(self.drone.position[1]))
+            dist_to_base = math.hypot(drone_pos[0] - bs_pos[0], drone_pos[1] - bs_pos[1])
+            if dist_to_base <= self.comm_range:
+                d_screen = self.graphics._world_to_screen(drone_pos)
+                self._draw_dashed_line(d_screen, bs_screen, (180, 180, 180), width=1)
 
         # Destroyed IED markers (crossed-out red circles)
         for died_pos in self._destroyed_ieds:
@@ -1674,22 +1747,63 @@ class DroneSimulationGUI:
             minimap_data["breadcrumbs"] = self._breadcrumbs
             if self.multi_drone_mode and self.drone_manager:
                 self._build_multi_drone_minimap_data(minimap_data)
-            elif hasattr(self.search_algorithm, 'get_grid_data'):
-                grid_data = self.search_algorithm.get_grid_data()
-                minimap_data["searched_cells"] = grid_data.get('searched_cells', [])
-                minimap_data["grid_size"] = grid_data.get('grid_size', 2.0)
-                s = self.search_algorithm
-                gs = s.grid_size
+            else:
+                # Single-drone: build from base station gossip (radio-only)
+                bs = self._single_base_station_gossip
+                grid_size = 2.0
+                # Convert searched cells from grid coords to world coords
+                all_searched = []
+                for cell in bs.global_searched:
+                    wx = cell[0] * grid_size + grid_size / 2
+                    wy = cell[1] * grid_size + grid_size / 2
+                    all_searched.append(((wx, wy), (255, 80, 80)))
+                minimap_data["searched_cells_colored"] = all_searched
+                minimap_data["searched_cells"] = [(c[0], c[1]) for c in all_searched]
+                minimap_data["grid_size"] = grid_size
                 frontier_world = []
-                for cell in s.free_cells:
-                    if cell[1] < 0:
+                for cell in bs.global_free:
+                    if cell[1] < 0 or cell in bs.global_searched or cell in bs.global_walls:
                         continue
-                    if cell in s.searched_cells or cell in s.wall_cells:
-                        continue
-                    frontier_world.append((cell[0] * gs + gs / 2, cell[1] * gs + gs / 2))
+                    frontier_world.append((cell[0] * grid_size + grid_size / 2,
+                                           cell[1] * grid_size + grid_size / 2))
                 minimap_data["frontier_cells"] = frontier_world
+                # Drone position only if base station knows it
+                if 0 in bs.known_positions:
+                    minimap_data["drone_positions"] = [(bs.known_positions[0], (255, 80, 80))]
+                else:
+                    minimap_data["drone_positions"] = []
+                # Features from base station (only IED and camera detections)
+                all_obj = []
+                all_ieds = []
+                for f in bs.features:
+                    if f.feature_type == 'ied':
+                        all_ieds.append((f.position, f.confidence, 'IED', (255, 80, 80)))
+                    else:
+                        all_obj.append((f.position, f.confidence, f.feature_type, (255, 80, 80)))
+                minimap_data["objects"] = all_obj
+                minimap_data["ieds"] = all_ieds
+                minimap_data["base_station_pos"] = (self._door_x, -3.0)
+                # Filter LiDAR wall segments to only areas the base station knows
+                known_area = set()
+                for c in (bs.global_searched | bs.global_free | bs.global_walls):
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            known_area.add((c[0] + dx, c[1] + dy))
+                gs = grid_size
+                minimap_data["radio_wall_segments"] = [
+                    seg for seg in minimap_data.get("wall_segments", [])
+                    if (int((seg[0][0] + seg[1][0]) / 2 / gs),
+                        int((seg[0][1] + seg[1][1]) / 2 / gs)) in known_area
+                ]
+                minimap_data["building_width"] = self.environment.width
+                minimap_data["building_height"] = self.environment.height
 
+        # Swap wall_segments for base station draw (radio-only walls)
+        lidar_wall_segments = minimap_data.get("wall_segments", [])
+        if "radio_wall_segments" in minimap_data:
+            minimap_data["wall_segments"] = minimap_data["radio_wall_segments"]
         self.graphics.draw_minimap(minimap_data, self.drone.position[:2])
+        minimap_data["wall_segments"] = lidar_wall_segments  # restore for drone maps
 
         # Per-drone maps (always shown)
         if self.multi_drone_mode and self.drone_manager:
@@ -1705,21 +1819,20 @@ class DroneSimulationGUI:
         except Exception:
             pass
 
-        # Collect objects found from all drones' gossip maps (with counts)
+        # Collect objects found from base station gossip (radio-only)
         object_counts = {}  # type -> count
-        if self.multi_drone_mode and self.drone_manager:
+        bs_features = None
+        if self.multi_drone_mode and self.drone_manager and self.drone_manager.base_station_gossip:
+            bs_features = self.drone_manager.base_station_gossip.features
+        elif self._single_base_station_gossip:
+            bs_features = self._single_base_station_gossip.features
+        if bs_features:
             seen = set()
-            for i in range(self.drone_manager.count):
-                for f in self.drone_manager.gossip_maps[i].features:
-                    key = (f.feature_type, round(f.position[0], 1), round(f.position[1], 1))
-                    if key not in seen:
-                        seen.add(key)
-                        object_counts[f.feature_type] = object_counts.get(f.feature_type, 0) + 1
-        else:
-            for feature in self.minimap.discovered_features:
-                obj_type = feature.additional_data.get('detection_type', '') if feature.additional_data else ''
-                if obj_type:
-                    object_counts[obj_type] = object_counts.get(obj_type, 0) + 1
+            for f in bs_features:
+                key = (f.feature_type, round(f.position[0], 1), round(f.position[1], 1))
+                if key not in seen:
+                    seen.add(key)
+                    object_counts[f.feature_type] = object_counts.get(f.feature_type, 0) + 1
         search_debug['objects_found'] = [f"{t}: {n}" for t, n in sorted(object_counts.items())]
         search_debug['ieds_destroyed'] = len(self._destroyed_ieds)
 
@@ -1760,25 +1873,33 @@ class DroneSimulationGUI:
         self._pending_drone_screenshots.clear()
 
     def _build_multi_drone_minimap_data(self, minimap_data):
-        """Build combined minimap data from all drones."""
-        all_searched = []
-        combined_free = set()
-        combined_searched = set()
-        combined_walls = set()
+        """Build Discovered Map data from the BASE STATION's gossip map.
 
-        for i in range(self.drone_manager.count):
-            search = self.drone_manager.get_search(i)
-            color = self.drone_manager.get_color(i)
-            combined_free.update(search.free_cells)
-            combined_searched.update(search.searched_cells)
-            combined_walls.update(search.wall_cells)
-            if hasattr(search, 'get_grid_data'):
-                grid_data = search.get_grid_data()
-                cells = grid_data.get('searched_cells', [])
-                for cell in cells:
-                    all_searched.append((cell, color))
+        The base station ONLY knows what drones have radioed back to it.
+        If a drone is out of comm range and no relay path exists, the base
+        station has no data from that drone."""
+        bs = self.drone_manager.base_station_gossip
+        if bs is None:
+            return
+
+        drone_colors = {i: self.drone_manager.get_color(i)
+                        for i in range(self.drone_manager.count)}
 
         grid_size = 2.0
+
+        # Searched cells colored by discovering drone (convert grid→world coords)
+        all_searched = []
+        for drone_id, cells in bs.searched_by_drone.items():
+            color = drone_colors.get(drone_id, (180, 180, 180))
+            for cell in cells:
+                wx = cell[0] * grid_size + grid_size / 2
+                wy = cell[1] * grid_size + grid_size / 2
+                all_searched.append(((wx, wy), color))
+
+        combined_free = bs.global_free
+        combined_searched = bs.global_searched
+        combined_walls = bs.global_walls
+
         all_frontiers = []
         for cell in combined_free:
             if cell[1] < 0 or cell in combined_searched or cell in combined_walls:
@@ -1787,50 +1908,67 @@ class DroneSimulationGUI:
             wy = cell[1] * grid_size + grid_size / 2
             all_frontiers.append((wx, wy))
 
+        # Per-drone frontiers (from base station's per-drone knowledge)
         frontiers_by_drone = {}
-        for i in range(self.drone_manager.count):
-            search = self.drone_manager.get_search(i)
+        for drone_id, free_set in bs.free_by_drone.items():
             drone_frontier = []
-            for cell in search.free_cells:
+            for cell in free_set:
                 if cell[1] < 0 or cell in combined_searched or cell in combined_walls:
                     continue
                 wx = cell[0] * grid_size + grid_size / 2
                 wy = cell[1] * grid_size + grid_size / 2
                 drone_frontier.append((wx, wy))
-            frontiers_by_drone[i] = drone_frontier
+            frontiers_by_drone[drone_id] = drone_frontier
 
         minimap_data["searched_cells_colored"] = all_searched
         minimap_data["searched_cells"] = [c[0] for c in all_searched]
         minimap_data["frontier_cells"] = all_frontiers
         minimap_data["frontiers_by_drone"] = frontiers_by_drone
         minimap_data["grid_size"] = 2.0
-        minimap_data["drone_colors"] = {i: self.drone_manager.get_color(i)
-                                         for i in range(self.drone_manager.count)}
-        minimap_data["drone_positions"] = [
-            (self.drone_manager.drones[i].position[:2], self.drone_manager.get_color(i))
-            for i in range(self.drone_manager.count)]
+        minimap_data["drone_colors"] = drone_colors
 
-        # Collect features (objects/IEDs) from all drones' gossip maps
-        # for the combined Discovered Map, colored by discovering drone
+        # Drone positions: ONLY show drones whose positions the base station knows
+        drone_positions = []
+        for drone_id, pos in bs.known_positions.items():
+            if drone_id >= 0 and drone_id < self.drone_manager.count:
+                drone_positions.append((pos, drone_colors.get(drone_id, (200, 200, 200))))
+        minimap_data["drone_positions"] = drone_positions
+
+        # Features from base station's gossip (only what was radioed)
         all_features_objects = []
         all_features_ieds = []
-        seen_positions = set()  # deduplicate by position
-        for i in range(self.drone_manager.count):
-            gossip = self.drone_manager.gossip_maps[i]
-            drone_color = self.drone_manager.get_color(i)
-            for feature in gossip.features:
-                # Deduplicate: skip if same type+position already added
-                key = (feature.feature_type, round(feature.position[0], 1), round(feature.position[1], 1))
-                if key in seen_positions:
-                    continue
-                seen_positions.add(key)
-                discoverer_color = minimap_data["drone_colors"].get(feature.drone_id, drone_color)
-                if feature.feature_type == 'ied':
-                    all_features_ieds.append((feature.position, feature.confidence, 'IED', discoverer_color))
-                else:
-                    all_features_objects.append((feature.position, feature.confidence, feature.feature_type, discoverer_color))
+        seen_positions = set()
+        for feature in bs.features:
+            key = (feature.feature_type, round(feature.position[0], 1), round(feature.position[1], 1))
+            if key in seen_positions:
+                continue
+            seen_positions.add(key)
+            discoverer_color = drone_colors.get(feature.drone_id, (180, 180, 180))
+            if feature.feature_type == 'ied':
+                all_features_ieds.append((feature.position, feature.confidence, 'IED', discoverer_color))
+            else:
+                all_features_objects.append((feature.position, feature.confidence, feature.feature_type, discoverer_color))
         minimap_data["objects"] = all_features_objects
         minimap_data["ieds"] = all_features_ieds
+
+        # Base station position for rendering
+        minimap_data["base_station_pos"] = self.drone_manager.base_station_pos
+
+        # Filter LiDAR wall segments to only areas the base station knows
+        known_area = set()
+        for c in (combined_searched | combined_free | combined_walls):
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    known_area.add((c[0] + dx, c[1] + dy))
+        gs = grid_size
+        minimap_data["radio_wall_segments"] = [
+            seg for seg in minimap_data.get("wall_segments", [])
+            if (int((seg[0][0] + seg[1][0]) / 2 / gs),
+                int((seg[0][1] + seg[1][1]) / 2 / gs)) in known_area
+        ]
+
+        minimap_data["building_width"] = self.environment.width
+        minimap_data["building_height"] = self.environment.height
 
     def _render_single_drone_map(self, minimap_data):
         """Render per-drone map for the single-drone case.
@@ -1972,28 +2110,57 @@ class DroneSimulationGUI:
         }
 
     def _render_multi_drone_overlay(self):
-        """Render sync lines, comm range circles, distance labels, status panel."""
+        """Render sync lines, comm range circles, distance labels, base station."""
         if not self.drone_manager:
             return
 
+        from core.drone_manager import BASE_STATION_ID
         font_dist = pygame.font.SysFont('Arial', 11)
         now = time.time()
 
-        # Sync visualization
+        # Base station icon (triangle at launch point)
+        if self.drone_manager.base_station_pos:
+            bs_screen = self.graphics._world_to_screen(self.drone_manager.base_station_pos)
+            # Draw a small triangle (base station antenna)
+            sz = 8
+            tri = [(bs_screen[0], bs_screen[1] - sz),
+                   (bs_screen[0] - sz, bs_screen[1] + sz),
+                   (bs_screen[0] + sz, bs_screen[1] + sz)]
+            pygame.draw.polygon(self.graphics.screen, (255, 255, 255), tri)
+            pygame.draw.polygon(self.graphics.screen, (0, 0, 0), tri, 2)
+            lbl = font_dist.render("BASE", True, (255, 255, 255))
+            self.graphics.screen.blit(lbl, (bs_screen[0] - 14, bs_screen[1] + sz + 2))
+            # Comm range circle for base station
+            radius = int(self.comm_range * self.graphics.scale)
+            pygame.draw.circle(self.graphics.screen, (200, 200, 200), bs_screen, radius, 1)
+
+        # Sync visualization (drone-to-drone and drone-to-base)
         for sync_time, sender_id, receiver_id in self.drone_manager.get_recent_syncs():
             age = now - sync_time
             if age > 2.0:
                 continue
             alpha = max(0.3, 1.0 - age / 2.0)
-            sender_color = self.drone_manager.get_color(sender_id)
-            line_color = (int(sender_color[0] * alpha),
-                          int(sender_color[1] * alpha),
-                          int(sender_color[2] * alpha))
-            pos1 = self.graphics._world_to_screen(self.drone_manager.drones[sender_id].position[:2])
-            pos2 = self.graphics._world_to_screen(self.drone_manager.drones[receiver_id].position[:2])
+            # Determine screen positions
+            if sender_id == BASE_STATION_ID:
+                pos1 = self.graphics._world_to_screen(self.drone_manager.base_station_pos)
+                line_color = (int(200 * alpha), int(200 * alpha), int(200 * alpha))
+            elif sender_id >= 0 and sender_id < self.drone_manager.count:
+                sender_color = self.drone_manager.get_color(sender_id)
+                line_color = (int(sender_color[0] * alpha),
+                              int(sender_color[1] * alpha),
+                              int(sender_color[2] * alpha))
+                pos1 = self.graphics._world_to_screen(self.drone_manager.drones[sender_id].position[:2])
+            else:
+                continue
+            if receiver_id == BASE_STATION_ID:
+                pos2 = self.graphics._world_to_screen(self.drone_manager.base_station_pos)
+            elif receiver_id >= 0 and receiver_id < self.drone_manager.count:
+                pos2 = self.graphics._world_to_screen(self.drone_manager.drones[receiver_id].position[:2])
+            else:
+                continue
             self._draw_dashed_line(pos1, pos2, line_color, width=2)
 
-        # Comm range circles
+        # Comm range circles for drones
         for i in range(self.drone_manager.count):
             drone = self.drone_manager.drones[i]
             color = self.drone_manager.get_color(i)
@@ -2109,7 +2276,7 @@ class DroneSimulationGUI:
             self._finalize_video()
         self._video_frame_count = 0
         self._video_frames_written = 0
-        self._video_filename = "_recording_in_progress.mp4"
+        self._video_filename = "Mission_Data/_recording_in_progress.mp4"
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         w, h = self.window_size
         self._video_writer = cv2.VideoWriter(self._video_filename, fourcc, 20, (w, h))
@@ -2177,7 +2344,7 @@ class DroneSimulationGUI:
         mm = elapsed // 60
         ss = elapsed % 60
         n = self.drone_count
-        final_name = f"sim_{n}d_{cov}pct_{mm}m{ss:02d}s.mp4"
+        final_name = f"Mission_Data/sim_{n}d_{cov}pct_{mm}m{ss:02d}s.mp4"
 
         try:
             if os.path.exists(self._video_filename):
@@ -2208,7 +2375,7 @@ class DroneSimulationGUI:
         ss = elapsed % 60
         n = self.drone_count
         tag_str = f"_{tag}" if tag else ""
-        filename = f"sim_{n}d_{mm}m{ss:02d}s_{cov}pct{tag_str}.png"
+        filename = f"Mission_Data/sim_{n}d_{mm}m{ss:02d}s_{cov}pct{tag_str}.png"
         try:
             pygame.image.save(self.graphics.screen, filename)
             print(f"Saved: {filename}")
@@ -2226,7 +2393,7 @@ class DroneSimulationGUI:
         elapsed = int((time.time() - start_t) * SIM_SPEED) if start_t else 0
         mm = elapsed // 60
         ss = elapsed % 60
-        filename = f"d{drone_id}_{tag}_{mm}m{ss:02d}s_{cov}pct.png"
+        filename = f"Mission_Data/d{drone_id}_{tag}_{mm}m{ss:02d}s_{cov}pct.png"
         try:
             pygame.image.save(self.graphics.screen, filename)
             print(f"Saved: {filename}")
@@ -2269,6 +2436,8 @@ class DroneSimulationGUI:
         self._destroyed_ieds.clear()
         self._drone_destroying.clear()
         self._mission_button_rects.clear()
+
+        self._single_base_station_gossip.reset()
 
         if self.multi_drone_mode and self.drone_manager:
             self.drone_manager.reset(entry_point=(self._door_x, -3.0))

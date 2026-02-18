@@ -13,11 +13,14 @@ from core.stm32wl.gossip_map import GossipMap
 from core.stm32n6.search_systematic_mapper import SystematicMapper
 
 
+BASE_STATION_ID = -1  # Special ID for the ground base station
+
+
 class DroneManager:
     """
     Manages multiple drones with mesh networking and coordinated search.
     """
-    
+
     # Drone colors for visualization (RGB tuples) — supports up to 12 drones
     COLORS = [
         (255, 80, 80),    # Red - Drone 0
@@ -86,6 +89,14 @@ class DroneManager:
         # List of (timestamp, visual_sender_id, visual_receiver_id)
         self.recent_syncs: List[Tuple[float, int, int]] = []
         self._sync_turn: Dict[Tuple[int, int], bool] = {}  # pair -> direction toggle
+
+        # Base station — ground controller at launch point
+        # Has its own GossipMap + MeshProtocol + MeshNode
+        # Receives map data ONLY via radio (direct or multi-hop relay)
+        self.base_station_pos: Optional[Tuple[float, float]] = None
+        self.base_station_gossip: Optional[GossipMap] = None
+        self.base_station_protocol: Optional[SimulatedMeshProtocol] = None
+        self.base_station_mesh: Optional[MeshNode] = None
     
     def initialize(self, entry_point: Tuple[float, float] = (25.0, -3.0)):
         """
@@ -161,7 +172,20 @@ class DroneManager:
             self.mission_start_times.append(None)
             self.breadcrumbs.append([])  # Empty trail for each drone
         
+        # ── Base Station (ground controller at launch point) ──────────
+        self.base_station_pos = (entry_point[0], entry_point[1])
+        self.positions[BASE_STATION_ID] = self.base_station_pos
+        self.base_station_protocol = SimulatedMeshProtocol(
+            drone_id=BASE_STATION_ID,
+            comm_range=self.comm_range,
+            positions_ref=self.positions,
+            message_bus=self.message_bus,
+        )
+        self.base_station_mesh = MeshNode(drone_id=BASE_STATION_ID, protocol=self.base_station_protocol)
+        self.base_station_gossip = GossipMap(drone_id=BASE_STATION_ID)
+
         print(f"DroneManager: Initialized {self.count} drones with {self.comm_range}m comm range")
+        print(f"  Base station at ({self.base_station_pos[0]:.1f}, {self.base_station_pos[1]:.1f})")
     
     def update_breadcrumbs(self):
         """Add current positions to each drone's breadcrumb trail."""
@@ -185,19 +209,23 @@ class DroneManager:
     def update_mesh(self) -> Dict[int, List[MeshMessage]]:
         """
         Update mesh networking - HELLO beacons and message processing.
-        
+
         Returns:
             Dict mapping drone_id to list of messages received
         """
         self.update_positions()
-        
+
         messages_per_drone: Dict[int, List[MeshMessage]] = {}
-        
+
         for i, mesh in enumerate(self.mesh_nodes):
             pos = self.positions[i]
             messages = mesh.update(pos)
             messages_per_drone[i] = messages
-        
+
+        # Base station mesh update (receives HELLO beacons, etc.)
+        if self.base_station_mesh and self.base_station_pos:
+            self.base_station_mesh.update(self.base_station_pos)
+
         return messages_per_drone
     
     def process_gossip(self, messages_per_drone: Dict[int, List[MeshMessage]]):
@@ -230,6 +258,12 @@ class DroneManager:
         # Clean old sync events (keep last 3 seconds for visualization)
         self.recent_syncs = [(t, s, r) for t, s, r in self.recent_syncs if now - t < 3.0]
 
+        # Update each drone's own position in its gossip map (for propagation)
+        for i in range(self.count):
+            pos_i = self.positions.get(i)
+            if pos_i:
+                self.gossip_maps[i].update_position(i, pos_i)
+
         # DIRECT gossip sync: check distance between all drone pairs
         # If within comm_range, directly merge gossip data
         for i in range(self.count):
@@ -255,6 +289,22 @@ class DroneManager:
                         visual_sender = i if turn else j
                         visual_receiver = j if turn else i
                         self.recent_syncs.append((now, visual_sender, visual_receiver))
+
+        # Base station gossip: check distance from each drone to base station
+        if self.base_station_gossip and self.base_station_pos:
+            for i in range(self.count):
+                pos_i = self.positions.get(i)
+                if pos_i:
+                    dist = math.hypot(pos_i[0] - self.base_station_pos[0],
+                                      pos_i[1] - self.base_station_pos[1])
+                    if dist <= self.comm_range:
+                        # Drone in range of base station — bidirectional sync
+                        payload_drone = self.gossip_maps[i].get_sync_payload()
+                        payload_base = self.base_station_gossip.get_sync_payload()
+                        self.base_station_gossip.merge_remote_update(payload_drone, force=True)
+                        self.gossip_maps[i].merge_remote_update(payload_base, force=True)
+                        # Record sync: drone → base station (for radio visualization)
+                        self.recent_syncs.append((now, i, BASE_STATION_ID))
 
         # Also try mesh broadcast (for multi-hop when it works)
         for i, mesh in enumerate(self.mesh_nodes):
@@ -390,9 +440,10 @@ class DroneManager:
         """
         Get drone pairs within direct gossip range (distance-based check).
         More reliable than mesh protocol HELLO beacons.
+        Includes base station links (BASE_STATION_ID, drone_id, distance).
 
         Returns:
-            List of (drone_id_1, drone_id_2, distance) tuples
+            List of (id_1, id_2, distance) tuples
         """
         links = []
         for i in range(self.count):
@@ -403,6 +454,15 @@ class DroneManager:
                     dist = math.hypot(pos_j[0] - pos_i[0], pos_j[1] - pos_i[1])
                     if dist <= self.comm_range:
                         links.append((i, j, dist))
+        # Base station links
+        if self.base_station_pos:
+            for i in range(self.count):
+                pos_i = self.positions.get(i)
+                if pos_i:
+                    dist = math.hypot(pos_i[0] - self.base_station_pos[0],
+                                      pos_i[1] - self.base_station_pos[1])
+                    if dist <= self.comm_range:
+                        links.append((BASE_STATION_ID, i, dist))
         return links
 
     def get_recent_syncs(self) -> List[Tuple[float, int, int]]:
@@ -455,13 +515,15 @@ class DroneManager:
     def set_comm_range(self, new_range: float):
         """
         Update communication range for all drones.
-        
+
         Args:
             new_range: New communication range in meters
         """
         self.comm_range = max(2.0, min(50.0, new_range))  # Clamp to reasonable range
         for protocol in self.protocols:
             protocol.update_comm_range(self.comm_range)
+        if self.base_station_protocol:
+            self.base_station_protocol.update_comm_range(self.comm_range)
         print(f"Comm range updated to {self.comm_range:.0f}m")
     
     def set_drone_count(self, count: int, entry_point: Tuple[float, float] = (25.0, -3.0)):

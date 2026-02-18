@@ -66,6 +66,10 @@ class GossipMap:
         
         # Timestamp of last sync with each drone
         self.last_sync: Dict[int, float] = {}
+
+        # Drone positions propagated through gossip (drone_id -> (x, y))
+        # Updated each gossip cycle so positions flow transitively
+        self.known_positions: Dict[int, Tuple[float, float]] = {}
     
     def add_local_searched(self, cells: Set[Tuple[int, int]]):
         """
@@ -130,6 +134,10 @@ class GossipMap:
         self.features.append(feature)
         self._increment_version()
     
+    def update_position(self, drone_id: int, position: Tuple[float, float]):
+        """Update a drone's known position (for gossip propagation)."""
+        self.known_positions[drone_id] = position
+
     def _increment_version(self):
         """Increment our version number."""
         self.versions[self.drone_id] = self.versions.get(self.drone_id, 0) + 1
@@ -170,7 +178,8 @@ class GossipMap:
                     "extra": f.extra_data
                 }
                 for f in self.features
-            ]
+            ],
+            "drone_positions": {did: list(pos) for did, pos in self.known_positions.items()},
         }
     
     def merge_remote_update(self, payload: dict, force: bool = False) -> bool:
@@ -239,7 +248,12 @@ class GossipMap:
         # Merge features
         for f_data in payload.get("features", []):
             self._merge_feature(f_data)
-        
+
+        # Merge drone positions (transitive: if A knows B's pos, C learns it via A)
+        for did_str, pos in payload.get("drone_positions", {}).items():
+            did = int(did_str) if isinstance(did_str, str) else did_str
+            self.known_positions[did] = tuple(pos)
+
         self.last_sync[sender_id] = time.time()
         
         # Only print significant merges (>5 new cells) to reduce spam
@@ -341,3 +355,4 @@ class GossipMap:
         self.versions.clear()
         self.received_versions.clear()
         self.last_sync.clear()
+        self.known_positions.clear()

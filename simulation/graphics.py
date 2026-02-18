@@ -651,28 +651,38 @@ class GraphicsEngine:
                 pygame.draw.circle(self.screen, Colors.WHITE, dp, 5, 1)
 
     def draw_minimap(self, minimap_data: Dict, drone_pos: Tuple[float, float]):
-        """Draw the Discovered Map using the unified _draw_map_panel."""
-        minimap_width = 350
-        minimap_height = 280
-        minimap_x = 50
-        minimap_y = 580
+        """Draw the Base Station Discovered Map at the same scale as the physical map.
+
+        This map shows ONLY what the base station has received via radio —
+        it is the realistic operator's view of the building."""
+        # Compute panel size to match the physical map's scale and aspect ratio.
+        # Use building dimensions to ensure discovered map matches physical map size.
+        bw = (minimap_data or {}).get("building_width", 25.0)
+        bh = (minimap_data or {}).get("building_height", 25.0)
+        # World bounds matching physical map extent (building + outdoor launch area)
+        world_bounds = (-1, -4, bw + 1, bh + 1)
+        world_w = world_bounds[2] - world_bounds[0]
+        world_h = world_bounds[3] - world_bounds[1]
+
+        # Match the physical map's pixel-per-meter scale
+        minimap_width = int(world_w * self.scale)
+        minimap_height = int(world_h * self.scale)
+
+        # Position below the physical map with gap for labels
+        minimap_x = self.offset_x  # align with physical map (50)
+        physical_map_bottom = int(bh * self.scale) + self.offset_y
+        minimap_y = physical_map_bottom + 120
 
         if not minimap_data:
-            # Draw empty panel with "Learning..." text
             rect = pygame.Rect(minimap_x, minimap_y, minimap_width, minimap_height)
             pygame.draw.rect(self.screen, Colors.WHITE, rect)
             pygame.draw.rect(self.screen, Colors.BLACK, rect, 2)
-            title_surface = self.font_small.render("Discovered Map", True, Colors.BLACK)
+            title_surface = self.font_small.render("Base Station — Discovered Map (radio only)", True, Colors.BLACK)
             self.screen.blit(title_surface, (minimap_x, minimap_y - 15))
-            learning_surface = self.font_small.render("Learning...", True, Colors.DARK_GRAY)
+            learning_surface = self.font_small.render("Waiting for radio data...", True, Colors.DARK_GRAY)
             text_rect = learning_surface.get_rect(center=(minimap_x + minimap_width // 2, minimap_y + minimap_height // 2))
             self.screen.blit(learning_surface, text_rect)
             return
-
-        # Build world bounds with margin
-        wb = minimap_data.get("world_bounds", (-5, -5, 55, 45))
-        margin = 5
-        world_bounds = (wb[0] - margin, wb[1] - margin, wb[2] + margin, wb[3] + margin)
 
         grid_size = minimap_data.get("grid_size", 2.0)
 
@@ -720,7 +730,7 @@ class GraphicsEngine:
 
         self._draw_map_panel(
             minimap_x, minimap_y, minimap_width, minimap_height,
-            "Discovered Map", Colors.BLACK, world_bounds, grid_size,
+            "Base Station — Discovered Map (radio only)", Colors.BLACK, world_bounds, grid_size,
             searched_cells=searched_cells,
             frontier_cells=frontiers_by_drone,
             wall_segments=minimap_data.get("wall_segments", []),
@@ -729,6 +739,23 @@ class GraphicsEngine:
             breadcrumbs=minimap_data.get("breadcrumbs", []),
             doors=minimap_data.get("doors", []),
         )
+
+        # Draw base station icon on the discovered map
+        bs_pos = minimap_data.get("base_station_pos")
+        if bs_pos:
+            min_x, min_y, max_x, max_y = world_bounds
+            pad = 15
+            x_ratio = (bs_pos[0] - min_x) / (max_x - min_x) if max_x != min_x else 0.5
+            y_ratio = (bs_pos[1] - min_y) / (max_y - min_y) if max_y != min_y else 0.5
+            bx = minimap_x + pad + int(x_ratio * (minimap_width - 2 * pad))
+            by = minimap_y + pad + int(y_ratio * (minimap_height - 2 * pad))
+            # White triangle with black outline
+            sz = 6
+            tri = [(bx, by - sz), (bx - sz, by + sz), (bx + sz, by + sz)]
+            pygame.draw.polygon(self.screen, (255, 255, 255), tri)
+            pygame.draw.polygon(self.screen, (0, 0, 0), tri, 2)
+            lbl = self.font_tiny.render("BASE", True, (0, 0, 0))
+            self.screen.blit(lbl, (bx - 10, by + sz + 1))
 
     def draw_drone_maps(self, drone_maps_data: List[dict], world_bounds: Tuple[float, float, float, float], wall_segments: List = None):
         """Draw individual maps for each drone using the unified _draw_map_panel."""

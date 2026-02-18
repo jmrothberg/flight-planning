@@ -201,6 +201,36 @@ score = bfs_distance (through free cells, respects walls)
 - **Global coverage**: computed from all search algorithms directly (not gossip)
 - Per-drone independent timers and screenshots
 
+## Base Station (Ground Controller)
+
+The **Discovered Map** is a realistic operator display, not a God's-eye debug view.
+It shows ONLY what the base station has received via radio transmissions.
+
+The base station is a physical ground controller sitting at the launch point
+(where drone 0 starts). It has a radio (same WL mesh radio as the drones) but
+no LiDAR, no camera, no sensors. It is the operator's only window into the building.
+
+**What it knows = only what was radioed to it:**
+- Map cells (walls, free, searched) arrive via the gossip protocol — either directly
+  from a drone in comm range, or hopped through intermediate drones
+- Wall outlines on the Discovered Map are LiDAR-quality segments, but filtered to only
+  show walls in areas the base station has received data about — no "magic" walls
+- Drone positions only appear on the Discovered Map if a position update reached
+  the base station (direct or relayed)
+- If a drone flies deep into the building and is out of range of all other drones,
+  the base station has **no idea** where it is or what it found — until another drone
+  relays that data
+- IED detections, object sightings — same rule: only shown if gossip delivered them
+- The **Objects Found** panel in the UI also reads from the base station — only objects
+  that were radioed back appear in the count
+
+**Radio visualization** shows signal flow direction (drone → base station), consistent
+with how all other radio links are drawn. The base station appears as a white triangle
+with a comm range circle on the physical map.
+
+**Scale**: The base station's Discovered Map is rendered at the same scale as the
+physical building map, so the operator can compare them directly.
+
 ## Manual Drone Control
 
 Click any drone on the map to select it (yellow ring appears), then press **M** to
@@ -232,7 +262,8 @@ Each drone has a mission shown in the Per-Drone Status panel as a clickable butt
 5. The drone automatically reverts to MAP mode after destruction
 
 The Objects Found panel shows both `ied: N` (total detected) and `IED destroyed: N`
-(total eliminated, in red).
+(total eliminated, in red). Object counts come from the base station's radio data —
+only detections that were radioed back appear in the panel.
 
 ## Wall Collision Reporting
 
