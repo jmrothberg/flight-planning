@@ -157,6 +157,7 @@ The building is populated with randomized objects (3 people, 1 equipment, 1 haza
 | **+/-** | Adjust Communication Range |
 | **P** | Save Screenshot |
 | **M** | Toggle Manual Control (select drone first) |
+| **L** | Toggle Radio Link Mode (Long-Range / Mesh) |
 | **Click drone** | Select drone (yellow ring) |
 | **Click [MAP]/[DSTR]** | Toggle drone mission (Map or Destroy) |
 | **ESC** | Exit |
@@ -241,6 +242,26 @@ enter manual mode. A dual-stick joystick panel appears in the UI:
 - IED sensor stays active during manual flight (cells are still marked as searched)
 - At 6 minutes, manual mode auto-releases for forced return home
 - Press **M** again to release and resume autonomous search
+
+### Radio Link Modes
+
+Manual control has two radio modes, toggled with **L** or clicking the radio button
+in the Controls panel:
+
+| Mode | Button | Processor | Range |
+|------|--------|-----------|-------|
+| **Long-Range** | `Long-Range (H7)` green | STM32H7 direct 900 MHz | Unlimited |
+| **Mesh Radio** | `Mesh Radio (WL)` red | STM32WL mesh network | Mesh-limited |
+
+- **Long-Range (default)** — Joystick commands go directly to the drone's STM32H7 flight
+  controller over a dedicated 900 MHz link. Works at any distance. This is the standard
+  military drone control link.
+
+- **Mesh Radio** — Joystick commands travel through the STM32WL mesh network, hopping from
+  the base station through intermediate drones to reach the target. Only works if there
+  is a radio path (direct or multi-hop) from the base station to the drone.
+  When the link drops, the drone hovers in place until the link is re-established.
+  The joystick panel shows **MESH: LINKED** (green) or **MESH: NO LINK** (red).
 
 ## Per-Drone Missions (Map / Destroy)
 

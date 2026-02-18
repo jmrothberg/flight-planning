@@ -35,7 +35,7 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 | `simulation/graphics.py` | Rendering — minimaps, drone maps, UI panels, mission buttons |
 | `simulation/joystick_widget.py` | Manual flight control — dual-stick joystick panel |
 
-## Current State (V12.2)
+## Current State (V12.3)
 
 ### What Works
 - Entry sequence (fly to door, enter building, 360 deg scan on entry)
@@ -60,6 +60,7 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 - **Radio-filtered walls** — base station walls are LiDAR segments filtered to radio-known areas
 - **Objects Found from radio** — UI panel reads from base station gossip, not direct drone data
 - **Base station data preserved** — adding/removing drones doesn't wipe the discovered map
+- **Manual radio mode toggle** — L key or click button to switch Long-Range (H7) vs Mesh (WL)
 
 ## DESIGN PRINCIPLES
 
@@ -229,6 +230,21 @@ Per-drone (independent timers, start when drone LAUNCHES — first frame):
 - 6-min timer auto-releases manual mode for forced return
 - Only one drone in manual mode at a time. Selecting a new drone releases the old one.
 - **File:** `simulation/joystick_widget.py` (JoystickPanel), `simulation_gui.py` (_apply_manual_input_to_drone)
+
+### Manual Control Radio Modes
+- **Long-Range Radio (default)** — Direct 900 MHz link through STM32H7. Unlimited range.
+  Current behavior: joystick commands always reach the drone regardless of distance.
+- **Mesh Radio** — Joystick commands travel through STM32WL mesh network. Commands hop
+  from base station through intermediate drones to reach the controlled drone. Only works
+  while there is a radio path (direct or multi-hop) from the base station.
+- Press **L** or click the radio mode button in Controls section to toggle.
+- When mesh mode is active and the link drops (drone out of range), the drone hovers
+  (zero velocity) — the pilot has no control until the link is re-established.
+- Joystick panel shows "MESH: LINKED" (green) or "MESH: NO LINK" (red) when in mesh mode.
+- Reachability check: BFS from BASE_STATION_ID through `get_gossip_links()` adjacency.
+  Single-drone mode: simple distance check to base station within `comm_range`.
+- **State:** `_manual_radio_mode` — "longrange" or "mesh". Reset to "longrange" on sim reset.
+- **File:** `simulation_gui.py` (_is_drone_mesh_reachable, _manual_radio_mode)
 
 ### Per-Drone Mission System
 - Two missions: `"map"` (default autonomous search) and `"destroy"` (fly to IED, detonate)

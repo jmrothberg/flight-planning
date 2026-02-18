@@ -252,6 +252,7 @@ class DroneSimulationGUI:
         self._selected_drone_id: Optional[int] = None
         self._manual_mode: Dict[int, bool] = {}
         self._joystick_panel: Optional[JoystickPanel] = None
+        self._manual_radio_mode: str = "longrange"  # "longrange" or "mesh"
 
         # Wall collision tracking (per drone ID -> count)
         self._wall_collisions: Dict[int, int] = {}
@@ -518,6 +519,14 @@ class DroneSimulationGUI:
                         self.drone_manager.set_comm_range(self.comm_range)
                 elif event.key == pygame.K_m:
                     self._toggle_manual_mode()
+                elif event.key == pygame.K_l:
+                    # Toggle manual control radio mode: longrange <-> mesh
+                    if self._manual_radio_mode == "longrange":
+                        self._manual_radio_mode = "mesh"
+                        print("[RADIO] Manual control: Mesh Radio (STM32WL) — range-limited")
+                    else:
+                        self._manual_radio_mode = "longrange"
+                        print("[RADIO] Manual control: Long-Range Radio (STM32H7) — unlimited")
                 elif event.key in [pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
                                    pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8, pygame.K_9]:
                     idx = event.key - pygame.K_1
@@ -603,9 +612,18 @@ class DroneSimulationGUI:
         print(f"MANUAL MODE OFF — D{drone_id} resuming autonomous")
 
     def _check_mission_button_click(self, mx: int, my: int) -> bool:
-        """Check if click hit a mission button. Toggle mission on click."""
+        """Check if click hit a mission or radio toggle button."""
         for drone_id, rect in self._mission_button_rects:
             if rect.collidepoint(mx, my):
+                # Radio toggle button
+                if drone_id == "radio_toggle":
+                    if self._manual_radio_mode == "longrange":
+                        self._manual_radio_mode = "mesh"
+                        print("[RADIO] Manual control: Mesh Radio (STM32WL) — range-limited")
+                    else:
+                        self._manual_radio_mode = "longrange"
+                        print("[RADIO] Manual control: Long-Range Radio (STM32H7) — unlimited")
+                    return True
                 current = self._drone_missions.get(drone_id, "map")
                 new_mission = "destroy" if current == "map" else "map"
                 self._drone_missions[drone_id] = new_mission
@@ -659,6 +677,38 @@ class DroneSimulationGUI:
         dy = float(drone.position[1])
         best = min(known_ieds, key=lambda p: math.hypot(p[0] - dx, p[1] - dy))
         return best
+
+    def _is_drone_mesh_reachable(self, drone_id: int) -> bool:
+        """Check if the base station can reach a drone via mesh radio (direct or multi-hop).
+
+        BFS from base station through all drones within comm_range of each other.
+        Returns True if a path exists from base station to drone_id."""
+        if self.multi_drone_mode and self.drone_manager:
+            links = self.drone_manager.get_gossip_links()
+            # Build adjacency: node -> set of connected nodes
+            adj: Dict[int, set] = {}
+            for a, b, _ in links:
+                adj.setdefault(a, set()).add(b)
+                adj.setdefault(b, set()).add(a)
+            # BFS from BASE_STATION_ID (-1) to drone_id
+            from core.drone_manager import BASE_STATION_ID
+            visited = {BASE_STATION_ID}
+            queue = [BASE_STATION_ID]
+            while queue:
+                node = queue.pop(0)
+                if node == drone_id:
+                    return True
+                for neighbor in adj.get(node, set()):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            return False
+        else:
+            # Single-drone: check direct range to base station
+            drone_pos = (float(self.drone.position[0]), float(self.drone.position[1]))
+            base_pos = (self._door_x, -3.0)
+            dist = math.hypot(drone_pos[0] - base_pos[0], drone_pos[1] - base_pos[1])
+            return dist <= self.comm_range
 
     def _apply_manual_input_to_drone(self, drone, search_algo):
         """Read joystick axes and apply velocity to drone in body frame.
@@ -833,7 +883,14 @@ class DroneSimulationGUI:
 
         # ── Manual control bypass: pilot flies directly ────────────
         if self._manual_mode.get(0, False):
-            self._apply_manual_input_to_drone(self.drone, self.search_algorithm)
+            # In mesh mode, check radio link before applying controls
+            if self._manual_radio_mode == "mesh" and not self._is_drone_mesh_reachable(0):
+                # No radio path — drone hovers (zero velocity), pilot has no link
+                self.drone.velocity[0] = 0.0
+                self.drone.velocity[1] = 0.0
+                self.drone.angular_velocity = 0.0
+            else:
+                self._apply_manual_input_to_drone(self.drone, self.search_algorithm)
             # IED sensor still runs during manual flight
             ied_reading = self.ied_sensor.read(
                 (float(self.drone.position[0]), float(self.drone.position[1])), self.environment)
@@ -1201,7 +1258,13 @@ class DroneSimulationGUI:
 
             # ── Manual control bypass for this drone ──────────────────
             if self._manual_mode.get(i, False):
-                self._apply_manual_input_to_drone(drone, search)
+                # In mesh mode, check radio link before applying controls
+                if self._manual_radio_mode == "mesh" and not self._is_drone_mesh_reachable(i):
+                    drone.velocity[0] = 0.0
+                    drone.velocity[1] = 0.0
+                    drone.angular_velocity = 0.0
+                else:
+                    self._apply_manual_input_to_drone(drone, search)
                 # IED sensor still runs
                 ied_reading = self.ied_sensor.read(
                     (float(drone.position[0]), float(drone.position[1])), self.environment)
@@ -1843,10 +1906,17 @@ class DroneSimulationGUI:
             multi_drone_data = self._build_single_drone_ui_data()
 
         simulated_elapsed = (time.time() - self._start_time) * SIM_SPEED if self._start_time else None
+        # Compute mesh link status for selected drone (for radio mode indicator)
+        radio_link_ok = True
+        if self._manual_radio_mode == "mesh" and self._selected_drone_id is not None:
+            if self._manual_mode.get(self._selected_drone_id, False):
+                radio_link_ok = self._is_drone_mesh_reachable(self._selected_drone_id)
+
         self._mission_button_rects = self.graphics.draw_ui(
             self.drone, self.slam, self.comm, simulated_elapsed,
             self.current_search_name, self.search_options, search_debug, multi_drone_data,
-            selected_drone=self._selected_drone_id, manual_mode=self._manual_mode) or []
+            selected_drone=self._selected_drone_id, manual_mode=self._manual_mode,
+            radio_mode=self._manual_radio_mode, radio_link_ok=radio_link_ok) or []
 
         self.graphics.draw_search_debug(search_debug, self.drone.position[:2])
 
@@ -1861,6 +1931,14 @@ class DroneSimulationGUI:
                 label = font_manual.render(f"MANUAL: D{did}", True, (255, 255, 0))
                 self.graphics.screen.blit(label,
                     (self._joystick_panel.x + 5, self._joystick_panel.y - 18))
+                # Show radio link status on joystick panel when in mesh mode
+                if self._manual_radio_mode == "mesh":
+                    if radio_link_ok:
+                        link_label = font_manual.render("MESH: LINKED", True, (0, 200, 0))
+                    else:
+                        link_label = font_manual.render("MESH: NO LINK", True, (255, 50, 50))
+                    self.graphics.screen.blit(link_label,
+                        (self._joystick_panel.x + 5, self._joystick_panel.y - 34))
             self._joystick_panel.draw(self.graphics.screen)
 
         self.graphics.present()
@@ -2436,6 +2514,7 @@ class DroneSimulationGUI:
         self._destroyed_ieds.clear()
         self._drone_destroying.clear()
         self._mission_button_rects.clear()
+        self._manual_radio_mode = "longrange"
 
         self._single_base_station_gossip.reset()
 

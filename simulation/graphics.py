@@ -281,10 +281,11 @@ class GraphicsEngine:
         pygame.draw.line(self.screen, color, (panel_x + 5, y + 18), (panel_x + 245, y + 18), 1)
         return y + 22
 
-    def draw_ui(self, drone, slam_system, comm_system, mission_start_time=None, search_method: Optional[str] = None, search_options: Optional[List[str]] = None, search_debug: Optional[Dict] = None, multi_drone_data: Optional[Dict] = None, selected_drone: Optional[int] = None, manual_mode: Optional[Dict] = None):
+    def draw_ui(self, drone, slam_system, comm_system, mission_start_time=None, search_method: Optional[str] = None, search_options: Optional[List[str]] = None, search_debug: Optional[Dict] = None, multi_drone_data: Optional[Dict] = None, selected_drone: Optional[int] = None, manual_mode: Optional[Dict] = None, radio_mode: str = "longrange", radio_link_ok: bool = True):
         """Draw right-side UI panel organized by processor responsibility.
 
-        Returns list of (drone_id, pygame.Rect) for mission button click targets."""
+        Returns list of (drone_id, pygame.Rect) for mission button click targets
+        and ('radio_toggle', pygame.Rect) for radio mode button."""
         mission_button_rects = []
         ui_rect = pygame.Rect(self.window_size[0] - 250, 0, 250, self.window_size[1])
         pygame.draw.rect(self.screen, Colors.LIGHT_GRAY, ui_rect)
@@ -496,11 +497,45 @@ class GraphicsEngine:
             "N: New Objects  B: New Building",
             "+/-: Comm Range  P: Screenshot",
             "M: Manual (click drone first)",
+            "L: Toggle Radio Link Mode",
             "ESC: Exit",
         ]
         for control in controls:
             self.screen.blit(self.font_small.render(control, True, Colors.BLACK), (x, y))
             y += lh
+
+        # Radio mode toggle button
+        y += 3
+        if radio_mode == "longrange":
+            btn_label = "Long-Range (H7)"
+            btn_color = (30, 130, 76)  # green
+            btn_text_color = Colors.WHITE
+        else:
+            btn_label = "Mesh Radio (WL)"
+            btn_color = (192, 57, 43)  # red
+            btn_text_color = Colors.WHITE
+        btn_surf = self.font_small.render(btn_label, True, btn_text_color)
+        btn_w = btn_surf.get_width() + 12
+        btn_h = btn_surf.get_height() + 6
+        btn_rect = pygame.Rect(x, y, btn_w, btn_h)
+        pygame.draw.rect(self.screen, btn_color, btn_rect, border_radius=3)
+        pygame.draw.rect(self.screen, Colors.BLACK, btn_rect, 1, border_radius=3)
+        self.screen.blit(btn_surf, (x + 6, y + 3))
+        mission_button_rects.append(("radio_toggle", btn_rect))
+
+        # Link status indicator (only when mesh mode + manual)
+        if radio_mode == "mesh":
+            is_manual = manual_mode.get(selected_drone, False) if manual_mode and selected_drone is not None else False
+            if is_manual:
+                status_x = x + btn_w + 8
+                if radio_link_ok:
+                    link_text = "LINKED"
+                    link_color = Colors.GREEN
+                else:
+                    link_text = "NO LINK"
+                    link_color = Colors.RED
+                self.screen.blit(self.font_small.render(link_text, True, link_color), (status_x, y + 3))
+        y += btn_h + 5
 
         if search_options and len(search_options) > 1:
             y += 5
