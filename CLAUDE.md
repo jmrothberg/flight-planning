@@ -25,6 +25,7 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 | `simulation_gui.py` | Orchestrator — entry sequence, LiDAR feeding, A* navigation, rotation scans |
 | `core/drone_manager.py` | Multi-drone — gossip sync, target claiming, spatial separation, global coverage |
 | `core/stm32wl/gossip_map.py` | Distributed map sharing — searched/free/wall cells per drone |
+| `core/stm32n6/pose_estimator.py` | Pose estimation — dead reckoning from IMU + optical flow, scan matching |
 | `core/stm32n6/navigation.py` | A* pathfinder (0.3m grid, 0.2m nav radius, 5000 max iterations) |
 | `core/processor_bus.py` | Inter-processor message types (SPI/UART data channels) |
 | `core/stm32h7/stm32h7_main.py` | Flight controller app — PID, motors, GPS, battery |
@@ -35,7 +36,7 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 | `simulation/graphics.py` | Rendering — minimaps, drone maps, UI panels, mission buttons |
 | `simulation/joystick_widget.py` | Manual flight control — dual-stick joystick panel |
 
-## Current State (V12.3)
+## Current State (V12.4)
 
 ### What Works
 - Entry sequence (fly to door, enter building, 360 deg scan on entry)
@@ -61,6 +62,10 @@ SIM_SPEED=3x (140 real seconds = 420 simulated = 7 minutes).
 - **Objects Found from radio** — UI panel reads from base station gossip, not direct drone data
 - **Base station data preserved** — adding/removing drones doesn't wipe the discovered map
 - **Manual radio mode toggle** — L key or click button to switch Long-Range (H7) vs Mesh (WL)
+- **Pose estimation pipeline** — realistic 2D localization from noisy sensors (E key toggle)
+- **Three pose modes** — TRUTH (debug), EST 100x acc (100x better than spec), EST 1x acc (real-world)
+- **Dead reckoning** — IMU gyroscope for heading + optical flow for velocity, integrated per frame
+- **Sensor noise models** — IMU bias drift, optical flow scale drift + dropouts, GPS position noise
 
 ## DESIGN PRINCIPLES
 
@@ -282,6 +287,60 @@ Per-drone (independent timers, start when drone LAUNCHES — first frame):
 - WL Mesh Radio section shows "Single drone — no mesh active" for 1 drone,
   link count for 2+ drones
 
+### Pose Estimation Pipeline (V12.4)
+- **File:** `core/stm32n6/pose_estimator.py` (PoseEstimator class)
+- **Toggle:** E key or click POSE button. Cycles: TRUTH → EST 100x acc → EST 1x acc → TRUTH
+- **GPS toggle:** G key (only when estimation ON)
+- **State:** `_pose_estimation_enabled`, `_pose_noise_scale`, `_gps_enabled`
+- **Single switchpoint:** `_get_autonomy_pose(drone, estimator)` returns est or truth based on toggle
+
+**Pipeline (each frame when inside building):**
+1. Compute actual velocity from position change / dt (NOT drone.velocity which is commanded)
+2. IMU gyroscope: truth orientation + white noise + bias drift → noisy_yaw
+3. Optical flow: truth velocity → body frame → scale drift + dropout + noise → noisy body vel
+4. Dead reckoning: rotate noisy body velocity by noisy_yaw, integrate to est_x/est_y
+5. GPS correction (if enabled): pull estimate toward noisy GPS reading @ 1 Hz
+6. Scan matching: DISABLED (see bug below)
+
+**What uses estimated pose (auto_pos, auto_yaw):**
+- SLAM grid map updates (`slam.update_direct(auto_pos, ...)`)
+- Minimap LiDAR scan recording
+- Search algorithm (`get_next_waypoint(auto_pos, ..., auto_yaw)`)
+- A* pathfinding current position
+- Rotation scan SLAM/minimap/search updates
+- Sensor position adjustment (`_sensor_pos_to_autonomy()` for IED/vision)
+
+**What stays on truth pose:**
+- `environment.get_lidar_scan(drone.position, ...)` — sensor physically IS at truth
+- `environment.get_camera_view(drone.position, ...)` — same
+- `ied_sensor.read(drone.position, ...)` — physical proximity check
+- `physics.update_drone(drone, dt)` — real physics
+- `_nav_escape_if_stuck()` — physical stuck detection needs real position
+- Breadcrumbs — show where drone physically went
+
+**Noise parameters (tunable at top of pose_estimator.py):**
+- IMU yaw: white noise std=0.005 rad/step, bias drift 0.0002 rad/s random walk
+- Optical flow: velocity noise std=0.05 m/s, scale drift 0.001/s, 2% dropout
+- GPS: position noise std=2.0m, 1 Hz update, fusion weight 0.15
+
+**Actual velocity (CRITICAL):**
+- `drone.velocity` is COMMANDED velocity (what nav wants). When stuck at a wall, it
+  stays at 2 m/s even though the drone isn't moving. Dead reckoning with commanded
+  velocity causes unbounded drift.
+- Must use ACTUAL velocity: `(current_pos - previous_pos) / dt`. This matches what
+  a real optical flow sensor measures — actual surface motion.
+- `_prev_truth_pos_single` and `_prev_truth_pos_multi[i]` track previous positions.
+  MUST be initialized at building entry to prevent first-frame offset.
+
+**Multi-drone:** Per-drone `PoseEstimator` instances in `_pose_estimators: Dict[int, PoseEstimator]`.
+Created in `_setup_multi_drone()`, preserved across drone count changes.
+
+**Reset:** `_reset_simulation()` re-initializes estimators at starting position, clears prev_pos.
+
+**NEVER:** Use `drone.velocity` for the pose estimator. Always use position-derived actual velocity.
+**NEVER:** Enable scan matching against a self-built map (see feedback loop bug below).
+**NEVER:** Remove the `_prev_truth_pos_single` initialization at building entry.
+
 ## CRITICAL BUGS FOUND AND FIXED — DO NOT REINTRODUCE
 
 ### Bug: IED Labels at Wrong Positions (drone pos instead of IED pos)
@@ -443,6 +502,47 @@ Infinite loop creating back-and-forth breadcrumb clusters.
 Search algorithm stuck params: sample 0.4s, threshold 0.8m, hold 1.5s.
 **NEVER:** Set nav escape timer < 1.0s or remove the cooldown. Will cause oscillation.
 
+### Bug: Scan Matching Feedback Loop (positive drift amplification)
+**File:** `core/stm32n6/pose_estimator.py`, `simulation_gui.py`
+**Symptom:** Estimated position drifts 0.35m per frame even when drone is stationary
+(vel=0,0). Error grows from 0 to 55m in seconds. Map becomes unrecognizable.
+**Root cause:** Scan matching against a self-built SLAM map creates a positive feedback
+loop. The SLAM map is updated at the ESTIMATED position. When scan matching shifts the
+estimate (even slightly), the next frame's SLAM data goes at the shifted position,
+corrupting the map. Next scan match finds another offset against the corrupted map.
+Each frame shifts ~0.32m × gain=0.8 = ~0.26m. At 60fps = 15 m/s of fake drift.
+**Proof:** Diagnostic logging showed: frames #1-5 with scan matching disabled had
+err=0.000m (dead reckoning perfect). When scan matching ran, shift=0.35m every frame
+with vel=(0,0). The scan matching was the sole source of all drift.
+**Fix:** Disabled scan matching by passing `None` for grid_map to the estimator.
+Dead reckoning with actual velocity is accurate at 100x spec (drift ~0.001m/s).
+**NEVER:** Enable scan matching against a SLAM map that was built from estimated
+positions. This creates an unbounded feedback loop. Scan matching only works against
+an external/pre-built reference map, or with proper safeguards (keyframe submap
+matching, minimum improvement threshold, loop closure detection).
+
+### Bug: Commanded vs Actual Velocity in Pose Estimation
+**File:** `simulation_gui.py`, pose estimator update
+**Symptom:** At 0.01x noise (100x accuracy), error grows to 40m in seconds.
+**Root cause:** `drone.velocity` is the COMMANDED velocity — what the navigation
+system wants, not what the physics engine allows. When stuck at a wall, nav commands
+2 m/s but physics blocks movement. Dead reckoning integrates commanded velocity,
+causing the estimate to fly through walls.
+**Fix:** Compute actual velocity from position change: `actual_vel = (pos - prev_pos) / dt`.
+This matches what a real optical flow sensor measures — actual surface motion (zero when
+stuck). Track `_prev_truth_pos_single` / `_prev_truth_pos_multi[i]`.
+**NEVER:** Pass `drone.velocity` to the pose estimator. Always use position-derived velocity.
+
+### Bug: First-Frame Velocity Offset in Pose Estimation
+**File:** `simulation_gui.py`, building entry
+**Symptom:** Permanent ~0.1m position offset creating ~50% extra wall cells (142 vs 96).
+**Root cause:** On first frame inside building, `_prev_truth_pos_single` didn't exist,
+so actual_vel=[0,0,0]. The estimator missed one frame of movement (~0.1m at 2 m/s).
+This permanent half-grid-cell offset made ~50% of SLAM wall endpoints hit wrong cells.
+**Fix:** Initialize `_prev_truth_pos_single` at building entry, right after
+`_pose_estimator.initialize()`. Same for multi-drone `_prev_truth_pos_multi[i]`.
+**NEVER:** Remove the `_prev_truth_pos_single` initialization at building entry points.
+
 ## Things That Were Tried and Failed
 - **Hard two-phase separation** (explore ONLY frontiers, then ONLY coverage): Starved
   drone of targets when frontiers were behind walls. Replaced with bonus-based scoring.
@@ -460,3 +560,10 @@ Search algorithm stuck params: sample 0.4s, threshold 0.8m, hold 1.5s.
   Must use search algorithm data directly.
 - **min_target_hold_time = 2.0s**: Too slow to retarget when stuck. Reduced to 1.0s.
 - **stuck_threshold = 1.0m**: Didn't catch small door oscillations. Reduced to 0.5m.
+- **Scan matching against self-built SLAM map**: Positive feedback loop — shifted
+  estimate corrupts map, corrupted map shifts estimate further. Must be disabled.
+- **SLAM particle filter with pose estimation**: Particle filter adds its own
+  motion_noise=(0.1, 0.1, 0.05) per frame, using internal position instead of
+  corrected auto_pos. Fix: `slam.update_direct()` bypasses particle filter.
+- **drone.velocity for optical flow**: Commanded velocity stays at 2 m/s when stuck.
+  Must use actual velocity from position change / dt.

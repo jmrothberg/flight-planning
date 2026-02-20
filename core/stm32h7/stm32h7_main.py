@@ -72,6 +72,16 @@ class GPSReading:
 
 
 @dataclass
+class OpticalFlowReading:
+    """Body-frame velocity from PMW3901/PAA5100 optical flow sensor."""
+    vx_body: float      # m/s forward (body frame)
+    vy_body: float      # m/s right (body frame)
+    height_m: float     # meters above ground
+    quality: int        # 0-255 (0=dropout/no surface)
+    timestamp_us: int
+
+
+@dataclass
 class BatteryReading:
     """Battery state from ADC voltage divider + current sensor."""
     voltage_v: float      # cell voltage (e.g., 3.7V nominal)
@@ -166,6 +176,24 @@ class FlightControllerApp:
             latitude=0.0, longitude=0.0,
             altitude_m=float(self.drone.position[2]),
             hdop=99.9, fix_type=0, num_satellites=0,
+        )
+
+    def read_optical_flow(self) -> OpticalFlowReading:
+        """Read optical flow sensor. On real HW: PMW3901 via SPI, ~100 Hz.
+        In simulation: derived from drone velocity + orientation (clean values,
+        noise is added by PoseEstimator)."""
+        ori = self.drone.orientation
+        vx = float(self.drone.velocity[0])
+        vy = float(self.drone.velocity[1])
+        # Rotate world velocity to body frame
+        body_fwd = vx * math.cos(ori) + vy * math.sin(ori)
+        body_right = -vx * math.sin(ori) + vy * math.cos(ori)
+        return OpticalFlowReading(
+            vx_body=body_fwd,
+            vy_body=body_right,
+            height_m=float(self.drone.position[2]),
+            quality=255,
+            timestamp_us=int(time.time() * 1e6),
         )
 
     def read_battery(self) -> BatteryReading:

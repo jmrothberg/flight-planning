@@ -1,4 +1,17 @@
-# Drone IED Search System
+# Drone IED Search System (LEGACY — V11.6a)
+
+> **NOTE:** This document is from V11.6a and is OUTDATED. See **README.md** for current
+> documentation and **CLAUDE.md** for technical details. Key differences since this was written:
+> - Grid changed from 3m to 2m (matching IED sensor range)
+> - LiDAR changed from 360-ray/25m to 54-ray/59° FoV/9m (realistic ST ToF sensor)
+> - Entry point is now `simulation_gui.py` (not `simulation_main.py`)
+> - Drones scale to 12 (not 4)
+> - 3-processor architecture (STM32H7/N6/WL) with realistic bus communication
+> - Pose estimation pipeline with IMU + optical flow dead reckoning
+> - Base station with radio-only discovered map
+> - Per-drone missions (Map/Destroy), manual control, radio link modes
+>
+> This file is kept for historical debugging context and lessons learned.
 
 ## Mission
 Search an UNKNOWN building for IEDs within 7 minutes. Return before battery dies.

@@ -78,6 +78,9 @@ from core.stm32wl.mesh_network import SimulatedMeshProtocol, MeshMessage
 # ── Legacy support: DroneManager for multi-drone coordination ────────────
 from core.drone_manager import DroneManager
 
+# ── Pose estimation pipeline ─────────────────────────────────────────────
+from core.stm32n6.pose_estimator import PoseEstimator
+
 # Search method config
 from algorithm_config import ALGORITHM as SEARCH_METHOD
 
@@ -268,6 +271,14 @@ class DroneSimulationGUI:
         # Base station for single-drone mode (multi uses DroneManager's base station)
         from core.stm32wl.gossip_map import GossipMap as _GossipMap
         self._single_base_station_gossip = _GossipMap(drone_id=-1)
+
+        # Pose estimation pipeline (button cycles TRUTH → EST 100x acc → EST 1x acc)
+        self._pose_estimation_enabled: bool = False   # Start with TRUTH (safe default)
+        self._pose_noise_scale: float = 0.01          # 0.01 = 100x accuracy, 1.0 = real-world
+        self._gps_enabled: bool = False
+        self._pose_estimator = PoseEstimator(drone_id=0)
+        self._pose_estimator.initialize(self._door_x, -3.0, 0.0)
+        self._pose_estimators: Dict[int, PoseEstimator] = {}
 
     # ══════════════════════════════════════════════════════════════════
     # SEARCH ALGORITHM LOADING (dynamically loads core.search_* modules)
@@ -527,6 +538,28 @@ class DroneSimulationGUI:
                     else:
                         self._manual_radio_mode = "longrange"
                         print("[RADIO] Manual control: Long-Range Radio (STM32H7) — unlimited")
+                elif event.key == pygame.K_e:
+                    # Same cycle as button: TRUTH → EST 100x accuracy → EST 1x accuracy → TRUTH
+                    if not self._pose_estimation_enabled:
+                        self._pose_estimation_enabled = True
+                        self._pose_noise_scale = 0.01
+                        self._apply_noise_scale(0.01)
+                        print("[POSE] Estimation ON — 100x accuracy (flow sensor 100x better than spec)")
+                    elif self._pose_noise_scale < 1.0:
+                        self._pose_noise_scale = 1.0
+                        self._apply_noise_scale(1.0)
+                        print("[POSE] Estimation ON — 1x accuracy (real-world spec)")
+                    else:
+                        self._pose_estimation_enabled = False
+                        print("[POSE] Estimation OFF — truth position")
+                    self._reinit_estimators_at_truth()
+                elif event.key == pygame.K_g:
+                    self._gps_enabled = not self._gps_enabled
+                    state = "ON" if self._gps_enabled else "OFF"
+                    self._pose_estimator.set_gps_enabled(self._gps_enabled)
+                    for pe in self._pose_estimators.values():
+                        pe.set_gps_enabled(self._gps_enabled)
+                    print(f"[POSE] GPS correction: {state}")
                 elif event.key in [pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
                                    pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8, pygame.K_9]:
                     idx = event.key - pygame.K_1
@@ -624,6 +657,26 @@ class DroneSimulationGUI:
                         self._manual_radio_mode = "longrange"
                         print("[RADIO] Manual control: Long-Range Radio (STM32H7) — unlimited")
                     return True
+                if drone_id == "pose_toggle":
+                    # Cycle: TRUTH → EST 100x accuracy → EST 1x accuracy → TRUTH
+                    if not self._pose_estimation_enabled:
+                        # TRUTH → EST 100x accuracy
+                        self._pose_estimation_enabled = True
+                        self._pose_noise_scale = 0.01
+                        self._apply_noise_scale(0.01)
+                        print("[POSE] Estimation ON — 100x accuracy (flow sensor 100x better than spec)")
+                    elif self._pose_noise_scale < 1.0:
+                        # EST 100x → EST 1x
+                        self._pose_noise_scale = 1.0
+                        self._apply_noise_scale(1.0)
+                        print("[POSE] Estimation ON — 1x accuracy (real-world spec)")
+                    else:
+                        # EST 1x → TRUTH
+                        self._pose_estimation_enabled = False
+                        print("[POSE] Estimation OFF — truth position")
+                    # Re-initialize estimators at truth to avoid stale drift
+                    self._reinit_estimators_at_truth()
+                    return True
                 current = self._drone_missions.get(drone_id, "map")
                 new_mission = "destroy" if current == "map" else "map"
                 self._drone_missions[drone_id] = new_mission
@@ -710,9 +763,10 @@ class DroneSimulationGUI:
             dist = math.hypot(drone_pos[0] - base_pos[0], drone_pos[1] - base_pos[1])
             return dist <= self.comm_range
 
-    def _apply_manual_input_to_drone(self, drone, search_algo):
+    def _apply_manual_input_to_drone(self, drone, search_algo, auto_pos=None):
         """Read joystick axes and apply velocity to drone in body frame.
-        Also marks current cell + cardinal neighbors as searched (IED sensor still on)."""
+        Also marks current cell + cardinal neighbors as searched (IED sensor still on).
+        Cell marking uses auto_pos (estimated position) when provided."""
         if not self._joystick_panel:
             return
         lx, ly, rx, ry = self._joystick_panel.get_axes()
@@ -742,9 +796,9 @@ class DroneSimulationGUI:
         drone.current_waypoint = None
 
         # Mark cells as searched (IED detector still scanning during manual flight)
-        # Mirrors the cell-marking logic in get_next_waypoint() of the search algorithm
+        # Uses estimated position — the drone marks cells where it THINKS it is
         if hasattr(search_algo, '_to_grid') and hasattr(search_algo, 'searched_cells'):
-            px, py = float(drone.position[0]), float(drone.position[1])
+            px, py = auto_pos if auto_pos else (float(drone.position[0]), float(drone.position[1]))
             curr_cell = search_algo._to_grid(px, py)
             if curr_cell in search_algo.free_cells:
                 search_algo.searched_cells.add(curr_cell)
@@ -754,6 +808,65 @@ class DroneSimulationGUI:
                         neighbor not in search_algo.wall_cells and
                         curr_cell not in search_algo.wall_cells):
                     search_algo.searched_cells.add(neighbor)
+
+    # ══════════════════════════════════════════════════════════════════
+    # POSE ESTIMATION HELPER
+    # ══════════════════════════════════════════════════════════════════
+
+    def _get_autonomy_pose(self, drone, estimator: PoseEstimator) -> Tuple[Tuple[float, float], float]:
+        """Return pose for autonomy stack: estimated or truth based on toggle.
+
+        Returns:
+            (pos_2d, yaw) where pos_2d is (x, y) and yaw is radians.
+        """
+        if not self._pose_estimation_enabled:
+            return (float(drone.position[0]), float(drone.position[1])), float(drone.orientation)
+
+        est_pos = estimator.get_position()
+        est_yaw = estimator.get_yaw()
+        return est_pos, est_yaw
+
+    def _sensor_pos_to_autonomy(self, sensor_world_pos: Tuple[float, float],
+                                 drone, auto_pos: Tuple[float, float]
+                                 ) -> Tuple[float, float]:
+        """Convert a sensor-reported world position to what the autonomy records.
+
+        A physical sensor (camera, IED detector) reports an object at its true
+        world position. But the drone only knows its own ESTIMATED position, so
+        it computes the object's location as:
+            estimated_self + (object_true - self_true)
+        which equals: object_true + (estimated_self - self_true).
+
+        When estimation is OFF, auto_pos == truth, so the offset is zero.
+        """
+        truth_x = float(drone.position[0])
+        truth_y = float(drone.position[1])
+        return (sensor_world_pos[0] + auto_pos[0] - truth_x,
+                sensor_world_pos[1] + auto_pos[1] - truth_y)
+
+    def _apply_noise_scale(self, scale: float):
+        """Set noise scale on all pose estimators."""
+        self._pose_estimator.set_noise_scale(scale)
+        for pe in self._pose_estimators.values():
+            pe.set_noise_scale(scale)
+
+    def _reinit_estimators_at_truth(self):
+        """Re-initialize all estimators at truth position to clear accumulated drift."""
+        if hasattr(self, 'drone') and self.drone:
+            self._pose_estimator.initialize(
+                float(self.drone.position[0]), float(self.drone.position[1]),
+                float(self.drone.orientation))
+            # Reset prev position so next frame computes correct velocity
+            self._prev_truth_pos_single = (float(self.drone.position[0]), float(self.drone.position[1]))
+        if self.drone_manager:
+            if not hasattr(self, '_prev_truth_pos_multi'):
+                self._prev_truth_pos_multi = {}
+            for i, drone in enumerate(self.drone_manager.drones):
+                pe = self._pose_estimators.get(i)
+                if pe:
+                    pe.initialize(float(drone.position[0]), float(drone.position[1]),
+                                  float(drone.orientation))
+                    self._prev_truth_pos_multi[i] = (float(drone.position[0]), float(drone.position[1]))
 
     # ══════════════════════════════════════════════════════════════════
     # SYSTEM UPDATES
@@ -795,13 +908,74 @@ class DroneSimulationGUI:
             self._last_breadcrumb_ts = time.time()
 
         # ── WORLD: Sensor readings (simulated environment) ───────────
+        # Sensors use TRUTH pose — they physically are at the true position
         self.lidar_data = self.environment.get_lidar_scan(self.drone.position, self.drone.orientation)
         camera_image = self.environment.get_camera_view(self.drone.position, self.drone.orientation)
 
-        # ── N6: SLAM + minimap update ────────────────────────────────
-        self.slam.update(self.drone.position[:2], self.lidar_data)
+        # ── N6: Pose estimation update ─────────────────────────────────
+        # Only run estimator inside building — no map for scan matching during entry,
+        # so dead reckoning drifts uncorrected and corrupts SLAM.
+        #
+        # CRITICAL: Use ACTUAL velocity (position change / dt), not drone.velocity.
+        # drone.velocity is the COMMANDED velocity — it stays nonzero even when the
+        # drone is stuck at a wall (physics blocks movement but nav keeps commanding).
+        # A real optical flow sensor measures actual surface motion, which is zero
+        # when stuck. Position-derived velocity matches what optical flow would read.
+        if self._inside_building:
+            curr_pos = (float(self.drone.position[0]), float(self.drone.position[1]))
+            if hasattr(self, '_prev_truth_pos_single') and dt > 0:
+                actual_vx = (curr_pos[0] - self._prev_truth_pos_single[0]) / dt
+                actual_vy = (curr_pos[1] - self._prev_truth_pos_single[1]) / dt
+                actual_vel = [actual_vx, actual_vy, 0.0]
+            else:
+                actual_vel = [0.0, 0.0, 0.0]
+            self._prev_truth_pos_single = curr_pos
+
+            # Snapshot estimate BEFORE update
+            pre_x = self._pose_estimator.est_x
+            pre_y = self._pose_estimator.est_y
+
+            # NOTE: Pass None for grid_map to DISABLE scan matching.
+            # Scan matching against a self-built map creates a feedback loop:
+            # shifted estimate → SLAM records at shifted pos → scan match finds
+            # another offset → shifts further. Dead reckoning alone is accurate.
+            self._pose_estimator.update(
+                dt, self.drone.position, self.drone.orientation,
+                actual_vel, self.lidar_data, None)
+
+            # Diagnostic: detect unexpected drift (should be near-zero at 100x accuracy)
+            if self._pose_estimation_enabled:
+                post_x = self._pose_estimator.est_x
+                post_y = self._pose_estimator.est_y
+                err_now = math.hypot(post_x - curr_pos[0], post_y - curr_pos[1])
+                if err_now > 1.0:
+                    if not hasattr(self, '_pose_drift_warned') or not self._pose_drift_warned:
+                        self._pose_drift_warned = True
+                        vel_mag = math.hypot(actual_vel[0], actual_vel[1])
+                        print(f"[POSE_WARN] Drift >1m: err={err_now:.3f}m "
+                              f"vel=({actual_vel[0]:.2f},{actual_vel[1]:.2f}) "
+                              f"est=({post_x:.2f},{post_y:.2f}) truth=({curr_pos[0]:.2f},{curr_pos[1]:.2f})")
+                else:
+                    if hasattr(self, '_pose_drift_warned'):
+                        self._pose_drift_warned = False
+
+        auto_pos, auto_yaw = self._get_autonomy_pose(self.drone, self._pose_estimator)
+
+        # Debug: log estimation error periodically
+        if self._pose_estimation_enabled and self._inside_building:
+            truth_2d = (float(self.drone.position[0]), float(self.drone.position[1]))
+            err = math.hypot(auto_pos[0] - truth_2d[0], auto_pos[1] - truth_2d[1])
+            now_t = time.time()
+            if not hasattr(self, '_last_pose_err_log') or now_t - self._last_pose_err_log > 3.0:
+                self._last_pose_err_log = now_t
+                accuracy_label = f"{int(1.0/self._pose_noise_scale)}x" if self._pose_noise_scale > 0 else "inf"
+                print(f"[POSE] err={err:.3f}m  est=({auto_pos[0]:.2f},{auto_pos[1]:.2f})  "
+                      f"truth=({truth_2d[0]:.2f},{truth_2d[1]:.2f})  accuracy={accuracy_label}")
+
+        # ── N6: SLAM + minimap update (uses estimated pose) ───────────
+        self.slam.update_direct(auto_pos, self.lidar_data)
         if self.lidar_data:
-            self.minimap.add_lidar_scan(self.drone.position[:2], self.lidar_data, self.drone.orientation)
+            self.minimap.add_lidar_scan(auto_pos, self.lidar_data, auto_yaw)
 
         # ── N6: Periodic rotation scan (360° from 59° FoV) ──────────
         if self._inside_building:
@@ -813,12 +987,13 @@ class DroneSimulationGUI:
                 num_extra_scans = max(1, int(2 * math.pi / hfov) - 1)
                 for scan_i in range(1, num_extra_scans + 1):
                     scan_angle = base_ori + scan_i * hfov
+                    # Sensor uses truth pose, autonomy uses estimated pose
                     extra_scan = self.environment.get_lidar_scan(self.drone.position, scan_angle)
-                    self.slam.update(self.drone.position[:2], extra_scan)
-                    self.minimap.add_lidar_scan(self.drone.position[:2], extra_scan, scan_angle)
+                    self.slam.update_direct(auto_pos, extra_scan)
+                    self.minimap.add_lidar_scan(auto_pos, extra_scan, scan_angle)
                     if hasattr(self.search_algorithm, 'feed_lidar_scan'):
                         self.search_algorithm.feed_lidar_scan(
-                            float(self.drone.position[0]), float(self.drone.position[1]),
+                            auto_pos[0], auto_pos[1],
                             extra_scan, scan_angle)
 
         # ── N6: Coverage milestone logging ───────────────────────────
@@ -831,22 +1006,24 @@ class DroneSimulationGUI:
                     free_n = len([c for c in self.search_algorithm.free_cells if c[1] >= 0])
                     print(f"[COVERAGE] {milestone}% at {sim_elapsed:.0f}s sim | {free_n} free cells discovered")
 
-        # ── N6: Vision processing ────────────────────────────────────
+        # ── N6: Vision processing (positions recorded at estimated pose) ─
         detected_objects = self.vision.process_frame(camera_image)
         if detected_objects:
             for detection in detected_objects:
+                det_pos = self._sensor_pos_to_autonomy(detection.position, self.drone, auto_pos)
                 self.minimap.add_vision_detection(
-                    detection.position,
+                    det_pos,
                     detection.object_type.value if hasattr(detection.object_type, 'value') else str(detection.object_type),
                     detection.confidence)
 
-        # ── N6: IED sensor ───────────────────────────────────────────
+        # ── N6: IED sensor (physical trigger from truth, record at estimated) ─
         ied_reading = self.ied_sensor.read(
             (float(self.drone.position[0]), float(self.drone.position[1])), self.environment)
         if ied_reading and ied_reading.confidence > 0.2:
             text = ied_reading.to_text()
             print(f"IED ALERT: {text}")
-            ied_pos = ied_reading.ied_position or (float(self.drone.position[0]), float(self.drone.position[1]))
+            raw_ied_pos = ied_reading.ied_position or (float(self.drone.position[0]), float(self.drone.position[1]))
+            ied_pos = self._sensor_pos_to_autonomy(raw_ied_pos, self.drone, auto_pos)
             self.minimap.add_ied_detection(ied_pos, ied_reading.confidence)
             self.comm.message_queue.put(Message(
                 id=str(time.time()), priority=MessagePriority.HIGH,
@@ -890,14 +1067,15 @@ class DroneSimulationGUI:
                 self.drone.velocity[1] = 0.0
                 self.drone.angular_velocity = 0.0
             else:
-                self._apply_manual_input_to_drone(self.drone, self.search_algorithm)
-            # IED sensor still runs during manual flight
+                self._apply_manual_input_to_drone(self.drone, self.search_algorithm, auto_pos)
+            # IED sensor still runs during manual flight (record at estimated pose)
             ied_reading = self.ied_sensor.read(
                 (float(self.drone.position[0]), float(self.drone.position[1])), self.environment)
             if ied_reading and ied_reading.confidence > 0.2:
                 text = ied_reading.to_text()
                 print(f"IED ALERT: {text}")
-                ied_pos = ied_reading.ied_position or (float(self.drone.position[0]), float(self.drone.position[1]))
+                raw_ied_pos = ied_reading.ied_position or (float(self.drone.position[0]), float(self.drone.position[1]))
+                ied_pos = self._sensor_pos_to_autonomy(raw_ied_pos, self.drone, auto_pos)
                 self.minimap.add_ied_detection(ied_pos, ied_reading.confidence)
             return  # Skip autonomous navigation
 
@@ -919,6 +1097,12 @@ class DroneSimulationGUI:
                 if self._entry_index >= len(self._entry_sequence):
                     self._inside_building = True
                     self._start_time = time.time()
+                    # Re-initialize estimator at truth position now that we have a building to map
+                    self._pose_estimator.initialize(
+                        float(self.drone.position[0]), float(self.drone.position[1]),
+                        float(self.drone.orientation))
+                    # Initialize prev position so first-frame velocity is zero (not missing)
+                    self._prev_truth_pos_single = (float(self.drone.position[0]), float(self.drone.position[1]))
                     self._do_full_rotation_scan()
                     print(f"Entered building, beginning {self.current_search_name} search...")
             elif entry_wp_elapsed > 5.0 and self.drone.position[1] > -4.0:
@@ -928,6 +1112,11 @@ class DroneSimulationGUI:
                 if self._entry_index >= len(self._entry_sequence):
                     self._inside_building = True
                     self._start_time = time.time()
+                    self._pose_estimator.initialize(
+                        float(self.drone.position[0]), float(self.drone.position[1]),
+                        float(self.drone.orientation))
+                    # Initialize prev position so first-frame velocity is zero (not missing)
+                    self._prev_truth_pos_single = (float(self.drone.position[0]), float(self.drone.position[1]))
                     self._do_full_rotation_scan()
                     print("Forced entry - beginning search...")
             else:
@@ -942,16 +1131,16 @@ class DroneSimulationGUI:
                 self.search_algorithm.set_simulated_time(simulated_elapsed)
 
             next_target_2d = self.search_algorithm.get_next_waypoint(
-                self.drone.position[:2],
+                auto_pos,
                 self.lidar_data if hasattr(self, 'lidar_data') else [],
-                self.drone.orientation)
+                auto_yaw)
 
             if next_target_2d is None:
                 self._do_full_rotation_scan()
                 next_target_2d = self.search_algorithm.get_next_waypoint(
-                    self.drone.position[:2],
+                    auto_pos,
                     self.lidar_data if hasattr(self, 'lidar_data') else [],
-                    self.drone.orientation)
+                    auto_yaw)
 
             # Still no target — move toward most open LiDAR direction
             if next_target_2d is None and self.lidar_data:
@@ -994,7 +1183,7 @@ class DroneSimulationGUI:
             escaped = (self._inside_building and
                        self._nav_escape_if_stuck(self.drone, 0, self.search_algorithm))
 
-            current_2d = (float(self.drone.position[0]), float(self.drone.position[1]))
+            current_2d = auto_pos
             path = self.slam.path_planner.get_path_to_next_point(current_2d, next_target_2d, self.environment)
 
             if escaped:
@@ -1035,9 +1224,10 @@ class DroneSimulationGUI:
 
         # ── WL: Base station sync (radio only) ─────────────────────
         # Base station at launch point receives data if drone is in comm range
-        drone_pos = (float(self.drone.position[0]), float(self.drone.position[1]))
+        # Comm range check uses truth (physical radio propagation)
+        drone_pos_truth = (float(self.drone.position[0]), float(self.drone.position[1]))
         base_pos = (self._door_x, -3.0)
-        dist_to_base = math.hypot(drone_pos[0] - base_pos[0], drone_pos[1] - base_pos[1])
+        dist_to_base = math.hypot(drone_pos_truth[0] - base_pos[0], drone_pos_truth[1] - base_pos[1])
         if dist_to_base <= self.comm_range:
             # Build a gossip-like payload from local search data
             bs = self._single_base_station_gossip
@@ -1049,7 +1239,8 @@ class DroneSimulationGUI:
             tmp.add_local_searched(s.searched_cells.copy())
             tmp.add_local_free(s.free_cells.copy())
             tmp.add_local_walls(s.wall_cells.copy())
-            tmp.update_position(0, drone_pos)
+            # Drone reports its ESTIMATED position over radio (not truth)
+            tmp.update_position(0, auto_pos)
             # Copy only IED and camera-detected features (skip walls/doors/obstacles)
             from core.stm32n6.minimap import FeatureType
             for f in self.minimap.discovered_features:
@@ -1062,9 +1253,9 @@ class DroneSimulationGUI:
             payload = tmp.get_sync_payload()
             bs.merge_remote_update(payload, force=True)
 
-        # ── WL: Communication (radio map updates) ────────────────────
+        # ── WL: Communication (radio reports estimated position) ───────
         if detected_objects:
-            self.comm.send_priority_data(detected_objects, self.drone.position[:2])
+            self.comm.send_priority_data(detected_objects, auto_pos)
 
         progress = self.slam.get_exploration_progress()
         if getattr(self, '_last_points_visited', None) is None:
@@ -1166,10 +1357,10 @@ class DroneSimulationGUI:
                 entry_seq = self.drone_manager.entry_sequences[i]
                 entry_idx = self.drone_manager.entry_indices[i]
 
-                # N6: SLAM during entry
+                # N6: SLAM during entry — use truth pose (no map for scan matching yet)
                 lidar_data = self.environment.get_lidar_scan(drone.position, drone.orientation)
                 if lidar_data:
-                    self.slam.update(drone.position[:2], lidar_data)
+                    self.slam.update_direct(drone.position[:2], lidar_data)
                     self.minimap.add_lidar_scan(drone.position[:2], lidar_data, drone.orientation)
 
                 # Entry stuck timeout
@@ -1182,6 +1373,15 @@ class DroneSimulationGUI:
                 if entry_elapsed > 10.0 and drone.position[1] > -2:
                     self.drone_manager.inside_building[i] = True
                     self.drone_manager.entry_indices[i] = len(entry_seq)
+                    # Re-initialize estimator at truth position for building exploration
+                    pe = self._pose_estimators.get(i)
+                    if pe:
+                        pe.initialize(float(drone.position[0]), float(drone.position[1]),
+                                      float(drone.orientation))
+                    # Initialize prev position so first-frame velocity is zero
+                    if not hasattr(self, '_prev_truth_pos_multi'):
+                        self._prev_truth_pos_multi = {}
+                    self._prev_truth_pos_multi[i] = (float(drone.position[0]), float(drone.position[1]))
                     self._do_multi_drone_rotation_scan(i, drone, search)
                     print(f"Drone {i} forced entry after {entry_elapsed:.0f}s")
                     del self._entry_start_times[i]
@@ -1194,6 +1394,15 @@ class DroneSimulationGUI:
                         self.drone_manager.entry_indices[i] += 1
                         if self.drone_manager.entry_indices[i] >= len(entry_seq):
                             self.drone_manager.inside_building[i] = True
+                            # Re-initialize estimator at truth position
+                            pe = self._pose_estimators.get(i)
+                            if pe:
+                                pe.initialize(float(drone.position[0]), float(drone.position[1]),
+                                              float(drone.orientation))
+                            # Initialize prev position so first-frame velocity is zero
+                            if not hasattr(self, '_prev_truth_pos_multi'):
+                                self._prev_truth_pos_multi = {}
+                            self._prev_truth_pos_multi[i] = (float(drone.position[0]), float(drone.position[1]))
                             self._do_multi_drone_rotation_scan(i, drone, search)
                             print(f"Drone {i} entered building")
                             if i in self._entry_start_times:
@@ -1216,10 +1425,32 @@ class DroneSimulationGUI:
                 continue
 
             # ── N6: LiDAR + SLAM (inside building) ──────────────────
+            # Sensor uses truth pose; autonomy uses estimated pose
             lidar_data = self.environment.get_lidar_scan(drone.position, drone.orientation)
-            self.slam.update(drone.position[:2], lidar_data)
+
+            # Pose estimator update for this drone
+            # Use actual velocity (position change), not commanded velocity
+            pe = self._pose_estimators.get(i)
+            if pe:
+                curr_pos_i = (float(drone.position[0]), float(drone.position[1]))
+                if not hasattr(self, '_prev_truth_pos_multi'):
+                    self._prev_truth_pos_multi = {}
+                if i in self._prev_truth_pos_multi and dt > 0:
+                    avx = (curr_pos_i[0] - self._prev_truth_pos_multi[i][0]) / dt
+                    avy = (curr_pos_i[1] - self._prev_truth_pos_multi[i][1]) / dt
+                    actual_vel_i = [avx, avy, 0.0]
+                else:
+                    actual_vel_i = [0.0, 0.0, 0.0]
+                self._prev_truth_pos_multi[i] = curr_pos_i
+                # Pass None for grid_map to disable scan matching (feedback loop)
+                pe.update(dt, drone.position, drone.orientation,
+                          actual_vel_i, lidar_data, None)
+            auto_pos, auto_yaw = self._get_autonomy_pose(
+                drone, pe) if pe else ((float(drone.position[0]), float(drone.position[1])), float(drone.orientation))
+
+            self.slam.update_direct(auto_pos, lidar_data)
             if lidar_data:
-                self.minimap.add_lidar_scan(drone.position[:2], lidar_data, drone.orientation)
+                self.minimap.add_lidar_scan(auto_pos, lidar_data, auto_yaw)
 
             # ── N6: Periodic rotation scan ───────────────────────────
             start_time_i = self.drone_manager.mission_start_times[i]
@@ -1236,20 +1467,21 @@ class DroneSimulationGUI:
                     for si in range(1, num_extra + 1):
                         scan_angle = base_ori + si * hfov
                         extra = self.environment.get_lidar_scan(drone.position, scan_angle)
-                        self.slam.update(drone.position[:2], extra)
-                        self.minimap.add_lidar_scan(drone.position[:2], extra, scan_angle)
+                        self.slam.update_direct(auto_pos, extra)
+                        self.minimap.add_lidar_scan(auto_pos, extra, scan_angle)
                         if hasattr(search, 'feed_lidar_scan'):
                             search.feed_lidar_scan(
-                                float(drone.position[0]), float(drone.position[1]),
+                                auto_pos[0], auto_pos[1],
                                 extra, scan_angle)
 
-            # ── N6: Vision processing (camera object detection) ──────
+            # ── N6: Vision processing (record at estimated pose) ──────
             camera_image = self.environment.get_camera_view(drone.position, drone.orientation)
             detected_objects = self.vision.process_frame(camera_image)
             if detected_objects:
                 for detection in detected_objects:
                     obj_type = detection.object_type.value if hasattr(detection.object_type, 'value') else str(detection.object_type)
-                    gossip.add_local_feature(obj_type, detection.position, detection.confidence)
+                    det_pos = self._sensor_pos_to_autonomy(detection.position, drone, auto_pos)
+                    gossip.add_local_feature(obj_type, det_pos, detection.confidence)
 
             # ── WL→N6: Gossip Phase 3 — push knowledge to search ────
             self.drone_manager.update_search_from_gossip(i)
@@ -1264,13 +1496,14 @@ class DroneSimulationGUI:
                     drone.velocity[1] = 0.0
                     drone.angular_velocity = 0.0
                 else:
-                    self._apply_manual_input_to_drone(drone, search)
-                # IED sensor still runs
+                    self._apply_manual_input_to_drone(drone, search, auto_pos)
+                # IED sensor still runs (record at estimated pose)
                 ied_reading = self.ied_sensor.read(
                     (float(drone.position[0]), float(drone.position[1])), self.environment)
                 if ied_reading and ied_reading.confidence > 0.2:
                     print(f"Drone {i} IED ALERT: {ied_reading.to_text()}")
-                    ied_pos = ied_reading.ied_position or tuple(drone.position[:2])
+                    raw_ied_pos = ied_reading.ied_position or tuple(drone.position[:2])
+                    ied_pos = self._sensor_pos_to_autonomy(raw_ied_pos, drone, auto_pos)
                     gossip.add_local_feature("ied", ied_pos, ied_reading.confidence)
                 continue  # Skip autonomous navigation for this drone
 
@@ -1300,7 +1533,7 @@ class DroneSimulationGUI:
                         self._pending_drone_screenshots.append((i, "done"))
 
                 target = home
-                current_pos = (float(drone.position[0]), float(drone.position[1]))
+                current_pos = auto_pos
                 path = self.slam.path_planner.get_path_to_next_point(
                     current_pos, home, self.environment)
                 if not path or len(path) <= 1:
@@ -1320,12 +1553,12 @@ class DroneSimulationGUI:
                             break
             else:
                 target = search.get_next_waypoint(
-                    drone.position[:2], lidar_data, drone.orientation)
+                    auto_pos, lidar_data, auto_yaw)
 
                 if target is None:
                     self._do_multi_drone_rotation_scan(i, drone, search)
                     target = search.get_next_waypoint(
-                        drone.position[:2], lidar_data, drone.orientation)
+                        auto_pos, lidar_data, auto_yaw)
                 if target is None and lidar_data:
                     target = self._lidar_fallback_target(drone.position, drone.orientation, lidar_data)
 
@@ -1355,7 +1588,7 @@ class DroneSimulationGUI:
                 escaped = (self.drone_manager.inside_building[i] and
                            self._nav_escape_if_stuck(drone, i, search))
 
-                current_pos = (float(drone.position[0]), float(drone.position[1]))
+                current_pos = auto_pos
                 path = self.slam.path_planner.get_path_to_next_point(
                     current_pos, target, self.environment)
 
@@ -1383,12 +1616,13 @@ class DroneSimulationGUI:
                         search.mark_target_unreachable()
                     self._fallback_navigation(drone, current_pos, target)
 
-            # ── N6: IED sensor for this drone ────────────────────────
+            # ── N6: IED sensor (physical trigger, record at estimated) ──
             ied_reading = self.ied_sensor.read(
                 (float(drone.position[0]), float(drone.position[1])), self.environment)
             if ied_reading and ied_reading.confidence > 0.2:
                 print(f"Drone {i} IED ALERT: {ied_reading.to_text()}")
-                ied_pos = ied_reading.ied_position or tuple(drone.position[:2])
+                raw_ied_pos = ied_reading.ied_position or tuple(drone.position[:2])
+                ied_pos = self._sensor_pos_to_autonomy(raw_ied_pos, drone, auto_pos)
                 gossip.add_local_feature("ied", ied_pos, ied_reading.confidence)
 
             # ── Destroy mission: look for known IEDs or check arrival ─
@@ -1540,11 +1774,74 @@ class DroneSimulationGUI:
         return moved
 
     # ══════════════════════════════════════════════════════════════════
+    # POSE ESTIMATION DEBUG OVERLAY
+    # ══════════════════════════════════════════════════════════════════
+
+    def _render_pose_estimation_debug(self):
+        """Draw estimated pose markers and error labels when estimation is ON."""
+        if not self._pose_estimation_enabled:
+            # Just show status text
+            font = pygame.font.SysFont('Arial', 11)
+            label = font.render("POSE: TRUTH", True, (150, 150, 150))
+            self.graphics.screen.blit(label, (10, 10))
+            return
+
+        font = pygame.font.SysFont('Arial', 11)
+
+        # Status text
+        noise_label = f"{self._pose_noise_scale:.1f}x" if self._pose_noise_scale < 1.0 else "1x"
+        pose_text = f"POSE: EST {noise_label}"
+        gps_text = f"GPS: {'ON' if self._gps_enabled else 'OFF'}"
+        pose_color = (255, 255, 0) if self._pose_noise_scale < 1.0 else (255, 80, 80)
+        pose_surf = font.render(pose_text, True, pose_color)
+        gps_color = (0, 255, 0) if self._gps_enabled else (150, 150, 150)
+        gps_surf = font.render(gps_text, True, gps_color)
+        self.graphics.screen.blit(pose_surf, (10, 10))
+        self.graphics.screen.blit(gps_surf, (110, 10))
+
+        # Draw markers for each drone
+        if self.multi_drone_mode and self.drone_manager:
+            drone_list = [(i, self.drone_manager.drones[i]) for i in range(self.drone_manager.count)]
+            estimators = self._pose_estimators
+        else:
+            drone_list = [(0, self.drone)]
+            estimators = {0: self._pose_estimator}
+
+        for drone_id, drone in drone_list:
+            pe = estimators.get(drone_id)
+            if pe is None:
+                continue
+
+            est_pos = pe.get_position()
+            truth_pos = (float(drone.position[0]), float(drone.position[1]))
+
+            pos_err, yaw_err = pe.get_error(truth_pos, float(drone.orientation))
+
+            # Draw yellow hollow circle at estimated position
+            est_screen = self.graphics._world_to_screen(est_pos)
+            truth_screen = self.graphics._world_to_screen(truth_pos)
+
+            est_radius = max(3, int(0.3 * self.graphics.scale))
+            pygame.draw.circle(self.graphics.screen, (255, 255, 0), est_screen, est_radius, 2)
+
+            # Draw line from truth to estimated position
+            if pos_err > 0.05:  # Only draw if error is visible
+                pygame.draw.line(self.graphics.screen, (255, 255, 0),
+                                 truth_screen, est_screen, 1)
+
+            # Error label
+            err_text = f"E:{pos_err:.2f}m"
+            err_surf = font.render(err_text, True, (255, 255, 0))
+            self.graphics.screen.blit(err_surf, (est_screen[0] + 10, est_screen[1] - 15))
+
+    # ══════════════════════════════════════════════════════════════════
     # ROTATION SCANS
     # ══════════════════════════════════════════════════════════════════
 
     def _do_full_rotation_scan(self):
-        """360° rotation scan — single drone."""
+        """360° rotation scan — single drone.
+        Sensor uses truth pose; SLAM/minimap/search use estimated pose."""
+        auto_pos, auto_yaw = self._get_autonomy_pose(self.drone, self._pose_estimator)
         base_ori = self.drone.orientation
         hfov = self.environment.lidar_hfov
         num_scans = max(1, int(2 * math.pi / hfov))
@@ -1552,16 +1849,20 @@ class DroneSimulationGUI:
             scan_angle = base_ori + si * hfov
             scan_data = self.environment.get_lidar_scan(self.drone.position, scan_angle)
             if scan_data:
-                self.slam.update(self.drone.position[:2], scan_data)
-                self.minimap.add_lidar_scan(self.drone.position[:2], scan_data, scan_angle)
+                self.slam.update_direct(auto_pos, scan_data)
+                self.minimap.add_lidar_scan(auto_pos, scan_data, scan_angle)
                 if hasattr(self.search_algorithm, 'feed_lidar_scan'):
                     self.search_algorithm.feed_lidar_scan(
-                        float(self.drone.position[0]), float(self.drone.position[1]),
+                        auto_pos[0], auto_pos[1],
                         scan_data, scan_angle)
         self._last_rotation_scan = (time.time() - self._start_time) * SIM_SPEED if self._start_time else 0
 
     def _do_multi_drone_rotation_scan(self, drone_idx: int, drone, search):
-        """360° rotation scan — multi-drone."""
+        """360° rotation scan — multi-drone.
+        Sensor uses truth pose; SLAM/minimap/search use estimated pose."""
+        pe = self._pose_estimators.get(drone_idx)
+        auto_pos, auto_yaw = self._get_autonomy_pose(
+            drone, pe) if pe else ((float(drone.position[0]), float(drone.position[1])), float(drone.orientation))
         base_ori = drone.orientation
         hfov = self.environment.lidar_hfov
         num_scans = max(1, int(2 * math.pi / hfov))
@@ -1569,11 +1870,11 @@ class DroneSimulationGUI:
             scan_angle = base_ori + si * hfov
             scan_data = self.environment.get_lidar_scan(drone.position, scan_angle)
             if scan_data:
-                self.slam.update(drone.position[:2], scan_data)
-                self.minimap.add_lidar_scan(drone.position[:2], scan_data, scan_angle)
+                self.slam.update_direct(auto_pos, scan_data)
+                self.minimap.add_lidar_scan(auto_pos, scan_data, scan_angle)
                 if hasattr(search, 'feed_lidar_scan'):
                     search.feed_lidar_scan(
-                        float(drone.position[0]), float(drone.position[1]),
+                        auto_pos[0], auto_pos[1],
                         scan_data, scan_angle)
 
     # ══════════════════════════════════════════════════════════════════
@@ -1676,10 +1977,26 @@ class DroneSimulationGUI:
                     search.exit_point = search_data.get('exit_point', None)
                     search.start_time = search_data['start_time']
 
+            # Create/preserve pose estimators for each drone
+            old_estimators = self._pose_estimators.copy()
+            self._pose_estimators = {}
+            for i in range(self.drone_count):
+                if i in old_estimators:
+                    self._pose_estimators[i] = old_estimators[i]
+                else:
+                    pe = PoseEstimator(drone_id=i)
+                    pos = self.drone_manager.drones[i].position
+                    ori = self.drone_manager.drones[i].orientation
+                    pe.initialize(float(pos[0]), float(pos[1]), float(ori))
+                    pe.set_gps_enabled(self._gps_enabled)
+                    pe.set_noise_scale(self._pose_noise_scale)
+                    self._pose_estimators[i] = pe
+
             print(f"Multi-drone mode: {self.drone_count} drones, {self.comm_range:.0f}m comm range (preserved {len(existing_states)} existing)")
         else:
             self.multi_drone_mode = False
             self.drone_manager = None
+            self._pose_estimators = {}
             print("Single drone mode")
 
     # ══════════════════════════════════════════════════════════════════
@@ -1772,6 +2089,9 @@ class DroneSimulationGUI:
                 mode_text = "MANUAL" if self._manual_mode.get(i, False) else "SELECTED"
                 mode_surf = font_drone.render(mode_text, True, (255, 255, 0))
                 self.graphics.screen.blit(mode_surf, (center[0] + drone_radius + 8, center[1] - 6))
+
+        # Pose estimation debug overlay
+        self._render_pose_estimation_debug()
 
         # SLAM map
         if self._show_map:
@@ -1916,7 +2236,10 @@ class DroneSimulationGUI:
             self.drone, self.slam, self.comm, simulated_elapsed,
             self.current_search_name, self.search_options, search_debug, multi_drone_data,
             selected_drone=self._selected_drone_id, manual_mode=self._manual_mode,
-            radio_mode=self._manual_radio_mode, radio_link_ok=radio_link_ok) or []
+            radio_mode=self._manual_radio_mode, radio_link_ok=radio_link_ok,
+            pose_estimation_enabled=self._pose_estimation_enabled,
+            gps_enabled=self._gps_enabled,
+            pose_noise_scale=self._pose_noise_scale) or []
 
         self.graphics.draw_search_debug(search_debug, self.drone.position[:2])
 
@@ -2515,6 +2838,16 @@ class DroneSimulationGUI:
         self._drone_destroying.clear()
         self._mission_button_rects.clear()
         self._manual_radio_mode = "longrange"
+
+        # Reset pose estimators
+        self._pose_estimator.initialize(self._door_x, -3.0, 0.0)
+        self._pose_estimator.set_gps_enabled(self._gps_enabled)
+        self._pose_estimator.set_noise_scale(self._pose_noise_scale)
+        self._pose_estimators.clear()
+        if hasattr(self, '_prev_truth_pos_single'):
+            del self._prev_truth_pos_single
+        if hasattr(self, '_prev_truth_pos_multi'):
+            self._prev_truth_pos_multi.clear()
 
         self._single_base_station_gossip.reset()
 

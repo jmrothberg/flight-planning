@@ -435,6 +435,18 @@ class SLAMSystem:
         if current_theta is not None:
             self.last_orientation = current_theta
     
+    def update_direct(self, pos: Tuple[float, float], lidar_data):
+        """Update grid map directly at given position, bypassing particle filter.
+
+        Used when external pose estimation (PoseEstimator) provides the position.
+        The particle filter adds its own motion noise which corrupts the map when
+        the input position already has estimation uncertainty.
+        """
+        if not self.initialized:
+            self.initialize(pos)
+        self.grid_map.update_with_lidar(pos, 0.0, lidar_data)
+        self.last_position = pos
+
     def get_map(self) -> GridMap:
         """Get current map."""
         return self.grid_map

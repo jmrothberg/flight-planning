@@ -94,6 +94,19 @@ class ManualControlInput:
     right_stick_y: float = 0.0  # Throttle/altitude (future 3D)
 
 
+# ── H7 → N6: Optical flow sensor data ─────────────────────────────────
+
+@dataclass
+class OpticalFlowUpdate:
+    """H7 -> N6 via SPI (with position updates).
+    Optical flow sensor provides body-frame velocity for dead reckoning.
+    On real HW: PMW3901 or PAA5100 optical flow sensor via SPI."""
+    vx_body: float      # m/s forward (body frame)
+    vy_body: float      # m/s right (body frame)
+    height_m: float     # meters above ground
+    quality: int = 255  # 0-255 (0=dropout/no surface)
+
+
 # ── Simulation Bus (pass-through in sim, SPI/UART on hardware) ──────────
 
 class SimulationBus:

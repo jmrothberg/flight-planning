@@ -38,7 +38,7 @@ The code is organized the same way — one directory per processor:
 | Processor | Chip | Clock | Role |
 |-----------|------|-------|------|
 | **H7** | STM32H755 Cortex-M7 | 480 MHz | Keeps the drone flying. PID stabilization at 400 Hz, motor control, GPS/IMU sensor fusion, battery monitoring, failsafe |
-| **N6** | STM32N6 NPU+M55 | 800 MHz | The "brain." Processes LiDAR scans, builds a map (SLAM), runs the search algorithm to pick targets, computes A* paths, detects IEDs and objects |
+| **N6** | STM32N6 NPU+M55 | 800 MHz | The "brain." Processes LiDAR scans, builds a map (SLAM), estimates pose from IMU + optical flow, runs the search algorithm to pick targets, computes A* paths, detects IEDs and objects |
 | **WL** | STM32WL sub-GHz | 48 MHz | The radio. Shares maps between drones using a gossip protocol over LoRa mesh. Discovers neighbors, broadcasts IED alerts |
 
 ### How They Talk to Each Other
@@ -82,6 +82,7 @@ flight_planning/
 │   │
 │   ├── stm32n6/                   # ── N6: Neural Processor ──
 │   │   ├── search_systematic_mapper.py  # THE search algorithm (target scoring)
+│   │   ├── pose_estimator.py      # Pose estimation (IMU + optical flow + dead reckoning)
 │   │   ├── navigation.py          # A* pathfinding (0.3m grid)
 │   │   ├── sensors.py             # IED sensor (2m range)
 │   │   ├── slam.py                # SLAM occupancy grid mapping
@@ -120,6 +121,8 @@ flight_planning/
 |-----------|--------------|
 | LiDAR | ST 3D ToF: 54 rays, 59° HFoV, 9m range — maps walls |
 | Camera | OV2640: 60° FoV, 8m range — detects people, equipment, hazards, weapons |
+| IMU | 9-axis (accel + gyro + mag) — gyroscope provides heading at 400 Hz |
+| Optical flow | PMW3901 — body-frame velocity from surface tracking |
 | IED sensor | 2m proximity detection — triggers when drone passes near an IED |
 | Grid resolution | 2m cells (matches IED sensor) |
 | Mesh radio | Sub-GHz LoRa, 12.5 KB/s, distance-based loss |
@@ -158,8 +161,11 @@ The building is populated with randomized objects (3 people, 1 equipment, 1 haza
 | **P** | Save Screenshot |
 | **M** | Toggle Manual Control (select drone first) |
 | **L** | Toggle Radio Link Mode (Long-Range / Mesh) |
+| **E** | Toggle Pose Estimation (TRUTH → EST 100x → EST 1x) |
+| **G** | Toggle GPS Correction (when estimation is ON) |
 | **Click drone** | Select drone (yellow ring) |
 | **Click [MAP]/[DSTR]** | Toggle drone mission (Map or Destroy) |
+| **Click POSE button** | Same as E — cycle pose estimation mode |
 | **ESC** | Exit |
 
 ## Search Algorithm (V11.9)
@@ -292,6 +298,41 @@ The per-drone status shows `W:N` — a count of real wall impacts. Only collisio
 the drone was moving >0.5 m/s count (not normal proximity clearance). In autonomous mode
 with LiDAR navigation, this should be 0. Manual flight into walls will increment the counter.
 
+## Pose Estimation (Realistic Localization)
+
+Real drones can't read their true position — they must estimate it from noisy sensors.
+The pose estimation pipeline (`core/stm32n6/pose_estimator.py`) simulates this:
+
+### Sensor Pipeline
+
+| Sensor | What it measures | Noise model |
+|--------|-----------------|-------------|
+| **IMU gyroscope** | Heading (yaw) | White noise + slow bias drift (random walk) |
+| **Optical flow** | Body-frame velocity | Scale drift + velocity noise + 2% dropouts |
+| **GPS** (optional) | Absolute position | 2.0m std noise, 1 Hz updates |
+
+Each frame: noisy IMU yaw + noisy optical flow velocity → rotate to world frame → integrate
+to estimated position. This is **dead reckoning** — it accumulates drift over time.
+
+### Three Modes
+
+| Mode | Button | Accuracy | Use case |
+|------|--------|----------|----------|
+| **TRUTH** | `POSE: TRUTH` (green) | Perfect | Default. Debug, baseline comparison |
+| **EST 100x** | `POSE: EST 100x acc` (yellow) | 100x better than spec | Validate pipeline works. Map slightly noisier but usable |
+| **EST 1x** | `POSE: EST 1x acc` (red) | Real-world spec | Realistic. Drift visible, may get stuck from accumulated error |
+
+Toggle with **E** key or click the POSE button. GPS correction toggled with **G** key.
+
+### Design Principle: Truth for Sensors, Estimate for Autonomy
+
+- **Sensors use truth position** — LiDAR, camera, IED sensor physically ARE at the true
+  position. You can't change where a sensor is by estimating wrong.
+- **Autonomy uses estimated position** — SLAM mapping, search algorithm, A* navigation,
+  minimap all use the drone's ESTIMATED position, because that's all a real drone knows.
+- This means with estimation ON, the map has slight noise (walls shift by estimation error),
+  and the search algorithm may make suboptimal decisions — exactly like a real system.
+
 ## Output Files
 
 | File Pattern | Description |
@@ -321,6 +362,9 @@ python3 simulation_gui.py
 
 ## Future Roadmap
 
+- **Scan Matching Against Pre-Built Maps** — Correct dead reckoning drift using keyframe-based
+  submap matching (not self-built map, which causes feedback loops)
+- **Magnetometer Fusion** — Indoor compass for absolute heading reference (noisy but bounded)
 - **3D Navigation** — Multiple floors, stairs, vertical connections (grid becomes voxels)
 - **Hallways & Tunnels** — Long narrow spaces with limited LiDAR visibility
 - **900 MHz Control Link** — Pilot telemetry, failsafe simulation

@@ -281,7 +281,7 @@ class GraphicsEngine:
         pygame.draw.line(self.screen, color, (panel_x + 5, y + 18), (panel_x + 245, y + 18), 1)
         return y + 22
 
-    def draw_ui(self, drone, slam_system, comm_system, mission_start_time=None, search_method: Optional[str] = None, search_options: Optional[List[str]] = None, search_debug: Optional[Dict] = None, multi_drone_data: Optional[Dict] = None, selected_drone: Optional[int] = None, manual_mode: Optional[Dict] = None, radio_mode: str = "longrange", radio_link_ok: bool = True):
+    def draw_ui(self, drone, slam_system, comm_system, mission_start_time=None, search_method: Optional[str] = None, search_options: Optional[List[str]] = None, search_debug: Optional[Dict] = None, multi_drone_data: Optional[Dict] = None, selected_drone: Optional[int] = None, manual_mode: Optional[Dict] = None, radio_mode: str = "longrange", radio_link_ok: bool = True, pose_estimation_enabled: bool = True, gps_enabled: bool = False, pose_noise_scale: float = 0.1):
         """Draw right-side UI panel organized by processor responsibility.
 
         Returns list of (drone_id, pygame.Rect) for mission button click targets
@@ -498,6 +498,7 @@ class GraphicsEngine:
             "+/-: Comm Range  P: Screenshot",
             "M: Manual (click drone first)",
             "L: Toggle Radio Link Mode",
+            "E: Pose Estimation  G: GPS",
             "ESC: Exit",
         ]
         for control in controls:
@@ -536,6 +537,32 @@ class GraphicsEngine:
                     link_color = Colors.RED
                 self.screen.blit(self.font_small.render(link_text, True, link_color), (status_x, y + 3))
         y += btn_h + 5
+
+        # Pose estimation toggle button — cycles TRUTH → EST 100x → EST 1x
+        if not pose_estimation_enabled:
+            pe_label = "POSE: TRUTH"
+            pe_color = (30, 130, 76)  # green
+            pe_text_color = Colors.WHITE
+        elif pose_noise_scale < 1.0:
+            accuracy = int(1.0 / pose_noise_scale) if pose_noise_scale > 0 else 999
+            pe_label = f"POSE: EST {accuracy}x acc"
+            pe_color = (241, 196, 15)  # bright yellow
+            pe_text_color = Colors.BLACK
+        else:
+            pe_label = "POSE: EST 1x acc"
+            pe_color = (231, 76, 60)  # red
+            pe_text_color = Colors.WHITE
+        if gps_enabled and pose_estimation_enabled:
+            pe_label += " +GPS"
+        pe_surf = self.font_small.render(pe_label, True, pe_text_color)
+        pe_w = pe_surf.get_width() + 12
+        pe_h = pe_surf.get_height() + 6
+        pe_rect = pygame.Rect(x, y, pe_w, pe_h)
+        pygame.draw.rect(self.screen, pe_color, pe_rect, border_radius=3)
+        pygame.draw.rect(self.screen, Colors.BLACK, pe_rect, 1, border_radius=3)
+        self.screen.blit(pe_surf, (x + 6, y + 3))
+        mission_button_rects.append(("pose_toggle", pe_rect))
+        y += pe_h + 5
 
         if search_options and len(search_options) > 1:
             y += 5
