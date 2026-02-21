@@ -18,8 +18,16 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Screenshots (keep a few examples, ignore bulk)
-# r_s_m_*.png
+# Screenshots and recordings
+screenshot_*.png
+*.mov
+*.mp4
+
+# Mission data output
+Mission_Data/
 
 # Logs
 *.log
+
+# Old architecture (deleted — do not re-add)
+old_architecture/
